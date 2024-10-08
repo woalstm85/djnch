@@ -113,7 +113,7 @@ class DataWorker(QThread):
                             for i in range(0, len(records), 500):
                                 batch = records[i:i + 500]
                                 conn.execute(text("""
-                                    INSERT INTO TEST_ICT_MILKING_LOG (
+                                    INSERT INTO ICT_MILKING_LOG (
                                         milking_id, YMD, AM_PM, HMS, cow_id, cow_number, cow_name, milkingshift_id,
                                         detacher_address, id_tag_number_assigned, milk_weight, dumped_milk,
                                         milk_conductivity, cow_activity, flow_0_15_sec, flow_15_30_sec,
