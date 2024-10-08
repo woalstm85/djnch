@@ -13,6 +13,7 @@ from sqlalchemy.exc import SQLAlchemyError, OperationalError, TimeoutError
 from datetime import datetime
 from PyQt5.QtCore import QTime
 
+
 # 리소스 파일에 접근할 수 있도록 경로 설정 함수
 def resource_path(relative_path):
     try:
@@ -32,8 +33,8 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 
 # PostgreSQL 및 MSSQL 연결 설정
-#pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
-pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
+pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
+#pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
 mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
 pg_engine = create_engine(pg_connection_string)
 mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
@@ -80,7 +81,7 @@ class DataWorker(QThread):
                                      , a.counts_perhr
                                      , a.cow_activity
                                      , to_char(a.tstamp, 'YYYYMMDD') AS ymd
-                                     , to_char(a.tstamp, 'HH24MMSS') AS hms
+                                     , to_char(a.tstamp, 'HH24MISS') AS hms
                                   FROM tblcowactivities a
                                  INNER JOIN tblcows b
                                         ON a.cow_id = b.cow_id
@@ -152,13 +153,13 @@ class DataWorker(QThread):
         self.update_text.emit("-> 중지 요청이 접수되었습니다... 중지 중입니다...\n")
         logger.info("중지 요청이 접수되었습니다.")
 
-
+from PyQt5.QtCore import QTimer
 from PyQt5.QtCore import QTimer
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Boumetic Activity_log")
+        self.setWindowTitle("보우메틱 활동량_log")
         self.setGeometry(300, 300, 500, 500)
 
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
@@ -182,18 +183,89 @@ class MainWindow(QMainWindow):
         self.text_edit = QTextEdit(self)
         self.text_edit.setReadOnly(True)
 
+        # 오전 및 오후 시작/종료 시간 입력 필드 추가
+        self.am_start_label = QLabel("오전 시작 시간:")
+        self.am_start_hour_input = QLineEdit(self)
+        self.am_start_hour_input.setFixedWidth(30)
+        self.am_start_hour_input.setPlaceholderText("시")
+
+        self.am_start_minute_input = QLineEdit(self)
+        self.am_start_minute_input.setFixedWidth(30)
+        self.am_start_minute_input.setPlaceholderText("분")
+
+        # 오전 시작 시간 기본값 6:00
+        self.am_start_hour_input.setText("06")
+        self.am_start_minute_input.setText("00")
+
+        self.am_end_label = QLabel("오전 종료 시간:")
+        self.am_end_hour_input = QLineEdit(self)
+        self.am_end_hour_input.setFixedWidth(30)
+        self.am_end_hour_input.setPlaceholderText("시")
+
+        self.am_end_minute_input = QLineEdit(self)
+        self.am_end_minute_input.setFixedWidth(30)
+        self.am_end_minute_input.setPlaceholderText("분")
+
+        # 오전 종료 시간 기본값 10:00
+        self.am_end_hour_input.setText("10")
+        self.am_end_minute_input.setText("00")
+
+        self.pm_start_label = QLabel("오후 시작 시간:")
+        self.pm_start_hour_input = QLineEdit(self)
+        self.pm_start_hour_input.setFixedWidth(30)
+        self.pm_start_hour_input.setPlaceholderText("시")
+
+        self.pm_start_minute_input = QLineEdit(self)
+        self.pm_start_minute_input.setFixedWidth(30)
+        self.pm_start_minute_input.setPlaceholderText("분")
+
+        # 오후 시작 시간 기본값 15:00
+        self.pm_start_hour_input.setText("15")
+        self.pm_start_minute_input.setText("00")
+
+        self.pm_end_label = QLabel("오후 종료 시간:")
+        self.pm_end_hour_input = QLineEdit(self)
+        self.pm_end_hour_input.setFixedWidth(30)
+        self.pm_end_hour_input.setPlaceholderText("시")
+
+        self.pm_end_minute_input = QLineEdit(self)
+        self.pm_end_minute_input.setFixedWidth(30)
+        self.pm_end_minute_input.setPlaceholderText("분")
+
+        # 오후 종료 시간 기본값 19:00
+        self.pm_end_hour_input.setText("19")
+        self.pm_end_minute_input.setText("00")
+
+        # 한 줄에 배치하기 위해 QHBoxLayout 사용
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(self.am_start_label)
+        time_layout.addWidget(self.am_start_hour_input)
+        time_layout.addWidget(self.am_start_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(self.am_end_label)
+        time_layout.addWidget(self.am_end_hour_input)
+        time_layout.addWidget(self.am_end_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(self.pm_start_label)
+        time_layout.addWidget(self.pm_start_hour_input)
+        time_layout.addWidget(self.pm_start_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(self.pm_end_label)
+        time_layout.addWidget(self.pm_end_hour_input)
+        time_layout.addWidget(self.pm_end_minute_input)
+
         self.interval_label = QLabel("수집주기 (초):", self)
         self.interval_input = QLineEdit(self)
         self.interval_input.setFixedWidth(50)
         self.interval_input.setText("10")
 
         self.start_button = QPushButton("데이터 수집 시작", self)
-        self.start_button.setFixedWidth(200)
+        self.start_button.setFixedWidth(300)
         self.start_button.setStyleSheet("color: green;")
         self.start_button.clicked.connect(self.start_data_collection)
 
         self.stop_button = QPushButton("데이터 수집 정지", self)
-        self.stop_button.setFixedWidth(200)
+        self.stop_button.setFixedWidth(300)
         self.stop_button.setStyleSheet("color: red;")
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_data_collection)
@@ -204,7 +276,16 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.start_button)
         controls_layout.addWidget(self.stop_button)
 
+        # 문구를 위한 QLabel 추가
+        self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.", self)
+        self.info_label.setStyleSheet("color: red;")  # 스타일을 추가해 강조
+        self.info_label.setFixedHeight(30)  # 라벨 높이 조절 (30픽셀로 고정)
+        self.info_label.setContentsMargins(0, 0, 10, 10)  # 여백 설정 (좌, 상, 우, 하)
+
+        # 기존 레이아웃에 추가
         layout = QVBoxLayout()
+        layout.addWidget(self.info_label)  # 문구를 상단에 추가
+        layout.addLayout(time_layout)  # 시간을 입력하는 레이아웃을 그 다음에 추가
         layout.addWidget(self.text_edit)
         layout.addLayout(controls_layout)
 
@@ -214,21 +295,60 @@ class MainWindow(QMainWindow):
 
         self.worker = None
 
-        # 15:00에 자동으로 시작하고, 18:00에 자동으로 중지하기 위한 타이머
+        # 타이머 설정
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.check_time_for_auto_start_stop)
-        self.timer.start(60000)  # 60초마다 시간 체크
+        self.timer.start(60000)
+
+        # 프로그램 실행 후 바로 시간 체크를 한 번 호출
+        self.check_time_for_auto_start_stop()  # <-- 이 부분 추가
 
     def check_time_for_auto_start_stop(self):
         current_time = QTime.currentTime()
 
-        # 13:00에 자동 시작
-        if current_time.hour() == 15 and current_time.minute() == 00:
+        # 입력된 오전 시작 시간
+        am_start_hour = int(self.am_start_hour_input.text())
+        am_start_minute = int(self.am_start_minute_input.text())
+
+        # 입력된 오전 종료 시간
+        am_end_hour = int(self.am_end_hour_input.text())
+        am_end_minute = int(self.am_end_minute_input.text())
+
+        # 입력된 오후 시작 시간
+        pm_start_hour = int(self.pm_start_hour_input.text())
+        pm_start_minute = int(self.pm_start_minute_input.text())
+
+        # 입력된 오후 종료 시간
+        pm_end_hour = int(self.pm_end_hour_input.text())
+        pm_end_minute = int(self.pm_end_minute_input.text())
+
+        # 현재 시간이 오전 시작 시간과 종료 시간 사이일 때만 작업 시작
+        if (current_time.hour() > am_start_hour or (
+                current_time.hour() == am_start_hour and current_time.minute() >= am_start_minute)) and \
+                (current_time.hour() < am_end_hour or (
+                        current_time.hour() == am_end_hour and current_time.minute() < am_end_minute)):
+            # 오전 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
             if not self.worker or not self.worker.isRunning():
                 self.start_data_collection()
 
-        # 18:00에 자동 중지
-        if current_time.hour() == 18 and current_time.minute() == 30:
+        # 현재 시간이 오후 시작 시간과 종료 시간 사이일 때만 작업 시작
+        elif (current_time.hour() > pm_start_hour or (
+                current_time.hour() == pm_start_hour and current_time.minute() >= pm_start_minute)) and \
+                (current_time.hour() < pm_end_hour or (
+                        current_time.hour() == pm_end_hour and current_time.minute() < pm_end_minute)):
+            # 오후 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
+            if not self.worker or not self.worker.isRunning():
+                self.start_data_collection()
+
+        # 현재 시간이 오전 종료 시간을 지났을 경우 멈춤
+        elif current_time.hour() > am_end_hour or (
+                current_time.hour() == am_end_hour and current_time.minute() >= am_end_minute):
+            if self.worker and self.worker.isRunning():
+                self.stop_data_collection()
+
+        # 현재 시간이 오후 종료 시간을 지났을 경우 멈춤
+        elif current_time.hour() > pm_end_hour or (
+                current_time.hour() == pm_end_hour and current_time.minute() >= pm_end_minute):
             if self.worker and self.worker.isRunning():
                 self.stop_data_collection()
 

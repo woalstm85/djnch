@@ -23,7 +23,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 # 로그 파일 이름 고정
-log_file_name = "data_activity.log"
+log_file_name = "data_milking.log"
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
 log_handler.setFormatter(log_formatter)
@@ -276,8 +276,14 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.start_button)
         controls_layout.addWidget(self.stop_button)
 
+        # 문구를 위한 QLabel 추가
+        self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.", self)
+        self.info_label.setStyleSheet("color: red; font-weight: bold;")  # 스타일을 추가해 강조
+
+        # 기존 레이아웃에 추가
         layout = QVBoxLayout()
-        layout.addLayout(time_layout)  # 시간을 입력하는 레이아웃을 위에 추가
+        layout.addWidget(self.info_label)  # 문구를 상단에 추가
+        layout.addLayout(time_layout)  # 시간을 입력하는 레이아웃을 그 다음에 추가
         layout.addWidget(self.text_edit)
         layout.addLayout(controls_layout)
 
