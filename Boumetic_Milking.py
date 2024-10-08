@@ -23,7 +23,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 # 로그 파일 이름 고정
-log_file_name = "data_activity.log"
+log_file_name = "data_milking.log"
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
 log_handler.setFormatter(log_formatter)
