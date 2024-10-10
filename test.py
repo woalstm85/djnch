@@ -33,8 +33,8 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 
 # PostgreSQL 및 MSSQL 연결 설정
-#pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
-pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
+pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
+#pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
 mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
 pg_engine = create_engine(pg_connection_string)
 mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
@@ -66,29 +66,48 @@ class DataWorker(QThread):
 
                     # MSSQL에서 최대 milking_id 값 조회
                     with mssql_engine.connect() as mssql_conn:
-                        max_activity_id = mssql_conn.execute(
-                            text("SELECT ISNULL(MAX(cowactivity_id), 0) FROM ICT_ACTIVITY_LOG")
+                        max_milking_id = mssql_conn.execute(
+                            text("SELECT ISNULL(MAX(milking_id), 0) FROM ICT_MILKING_ORG_LOG")
                         ).scalar()
 
                     # PostgreSQL에서 데이터 가져오기
                     with pg_engine.connect() as pg_conn:
                         query = text("""
-                                SELECT a.cowactivity_id
-                                     , a.cow_id
-                                     , b.cow_number
-                                     , b.cow_name
-                                     , a.counts
-                                     , a.counts_perhr
-                                     , a.cow_activity
-                                     , to_char(a.tstamp, 'YYYYMMDD') AS ymd
-                                     , to_char(a.tstamp, 'HH24MMSS') AS hms
-                                  FROM tblcowactivities a
-                                 INNER JOIN tblcows b
+                                    SELECT 
+                                        a.milking_id,
+                                        to_char(a.tstamp, 'YYYYMMDD') AS YMD,
+                                        CASE 
+                                            WHEN to_char(a.tstamp, 'HH24MISS') < '120000' THEN '1' 
+                                            ELSE '2' 
+                                        END AS AM_PM,
+                                        to_char(a.tstamp, 'HH24MISS') AS HMS,
+                                        a.cow_id,
+                                        b.cow_number,
+                                        b.cow_name,
+                                        a.milkingshift_id,
+                                        detacher_address,
+                                        id_tag_number_assigned,
+                                        round(CAST(float8 (milk_weight * 0.45359) as numeric), 1) AS milk_weight,
+                                        round(CAST(float8 (dumped_milk * 0.45359) as numeric), 1) AS dumped_milk,
+                                        milk_conductivity,
+                                        cow_activity,
+                                        convertunits(c.flow_0_15_sec) AS flow_0_15_sec,
+                                        convertunits(c.flow_15_30_sec) AS flow_15_30_sec,
+                                        convertunits(c.flow_30_60_sec) AS flow_30_60_sec,
+                                        convertunits(c.flow_60_120_sec) AS flow_60_120_sec,
+                                        c.time_in_low_flow,
+                                        c.reattach_counter,
+                                        c.percent_expected_milk
+                                    FROM tblmilkings AS a
+                                    INNER JOIN public.vewcows AS b 
                                         ON a.cow_id = b.cow_id
-                                where a.cowactivity_id > :max_activity_id
-                                order by a.cow_id, cowactivity_id;
+                                    INNER JOIN public.tblstallperformances AS c 
+                                        ON a.milking_id = c.milking_id
+                                    WHERE id_tag_number_assigned <> ''
+                                      AND a.milking_id > :max_milking_id
+                                    ORDER BY a.milkingshift_id, a.identified_tstamp
                         """)
-                        result = pg_conn.execute(query, {"max_activity_id": max_activity_id})
+                        result = pg_conn.execute(query, {"max_milking_id": max_milking_id})
                         data = result.fetchall()
 
                     pg_row_count = len(data)
@@ -98,19 +117,35 @@ class DataWorker(QThread):
                     if pg_row_count == 0:
                         self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
                     else:
-                        df = pd.DataFrame(data, columns=["cowactivity_id", "cow_id", "cow_number", "cow_name", "counts", "counts_perhr", "cow_activity", "ymd", "hms"])
-                        start_mssql_time = time.time()
+                        # 데이터프레임으로 변환
+                        df = pd.DataFrame(data, columns=[
+                            "milking_id", "YMD", "AM_PM", "HMS", "cow_id", "cow_number", "cow_name", "milkingshift_id",
+                            "detacher_address", "id_tag_number_assigned", "milk_weight", "dumped_milk",
+                            "milk_conductivity", "cow_activity", "flow_0_15_sec", "flow_15_30_sec",
+                            "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
+                            "percent_expected_milk"
+                        ])
 
                         records = df.to_dict(orient='records')
                         with mssql_engine.connect() as conn:
-                            for i in range(0, len(records), 500):
+                            postgresql_complete_time = time.time() # PostgreSQL에서 데이터를 가져온 후, 완료 시점 시간 기록
+                            for i in range(0, len(records), 500):  # 500개씩 배치 처리
                                 batch = records[i:i + 500]
-                                conn.execute(text("""
-                                INSERT INTO ICT_ACTIVITY_LOG (cowactivity_id, cow_id, cow_number, cow_name, counts, counts_perhr, cow_activity, ymd, hms
-                                ) VALUES (:cowactivity_id, :cow_id, :cow_number, :cow_name, :counts, :counts_perhr, :cow_activity, :ymd, :hms)
-                                """), batch)
-                            conn.commit()  # 커밋을 명시적으로 호출
-                        mssql_duration = time.time() - start_mssql_time
+                                for record in batch:  # 각 record를 저장 프로시저에 전달
+                                    conn.execute(text("""
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=:milking_id, @ymd=:YMD, @am_pm=:AM_PM, @hms=:HMS, @cow_id=:cow_id, 
+                                            @cow_number=:cow_number, @cow_name=:cow_name, @milkingshift_id=:milkingshift_id, 
+                                            @detacher_address=:detacher_address, @id_tag_number_assigned=:id_tag_number_assigned, 
+                                            @milk_weight=:milk_weight, @dumped_milk=:dumped_milk, @milk_conductivity=:milk_conductivity, 
+                                            @cow_activity=:cow_activity, @flow_0_15_sec=:flow_0_15_sec, @flow_15_30_sec=:flow_15_30_sec, 
+                                            @flow_30_60_sec=:flow_30_60_sec, @flow_60_120_sec=:flow_60_120_sec, 
+                                            @time_in_low_flow=:time_in_low_flow, @reattach_counter=:reattach_counter, 
+                                            @percent_expected_milk=:percent_expected_milk
+                                    """), record)
+                            conn.commit()  # 배치 처리 후 커밋
+
+                        mssql_duration = time.time() - postgresql_complete_time
                         self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
                         self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
                         logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
@@ -154,17 +189,16 @@ class DataWorker(QThread):
         logger.info("중지 요청이 접수되었습니다.")
 
 from PyQt5.QtCore import QTimer
-from PyQt5.QtCore import QTimer
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Boumetic Activity_log")
+        self.setWindowTitle("보우메틱 착유량")
         self.setGeometry(300, 300, 500, 500)
 
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
 
-        icon_path = resource_path("activity.png")
+        icon_path = resource_path("milking.png")
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(QIcon(icon_path))
 
@@ -257,7 +291,7 @@ class MainWindow(QMainWindow):
         self.interval_label = QLabel("수집주기 (초):", self)
         self.interval_input = QLineEdit(self)
         self.interval_input.setFixedWidth(50)
-        self.interval_input.setText("10")
+        self.interval_input.setText("120")
 
         self.start_button = QPushButton("데이터 수집 시작", self)
         self.start_button.setFixedWidth(300)
@@ -278,7 +312,9 @@ class MainWindow(QMainWindow):
 
         # 문구를 위한 QLabel 추가
         self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.", self)
-        self.info_label.setStyleSheet("color: red; font-weight: bold;")  # 스타일을 추가해 강조
+        self.info_label.setStyleSheet("color: red;")  # 스타일을 추가해 강조
+        self.info_label.setFixedHeight(30)  # 라벨 높이 조절 (30픽셀로 고정)
+        self.info_label.setContentsMargins(0, 0, 10, 10)  # 여백 설정 (좌, 상, 우, 하)
 
         # 기존 레이아웃에 추가
         layout = QVBoxLayout()
@@ -406,7 +442,7 @@ class MainWindow(QMainWindow):
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    icon_path = resource_path("activity.png")
+    icon_path = resource_path("milking.png")
     app.setWindowIcon(QIcon(icon_path))
     window = MainWindow()
     window.show()

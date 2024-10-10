@@ -67,7 +67,7 @@ class DataWorker(QThread):
                     # MSSQL에서 최대 milking_id 값 조회
                     with mssql_engine.connect() as mssql_conn:
                         max_milking_id = mssql_conn.execute(
-                            text("SELECT ISNULL(MAX(milking_id), 0) FROM ICT_MILKING_LOG")
+                            text("SELECT ISNULL(MAX(milking_id), 0) FROM ICT_MILKING_ORG_LOG WITH(NOLOCK)")
                         ).scalar()
 
                     # PostgreSQL에서 데이터 가져오기
@@ -75,12 +75,12 @@ class DataWorker(QThread):
                         query = text("""
                                     SELECT 
                                         a.milking_id,
-                                        to_char(identified_tstamp, 'YYYYMMDD') AS YMD,
+                                        to_char(a.tstamp, 'YYYYMMDD') AS YMD,
                                         CASE 
-                                            WHEN to_char(identified_tstamp, 'HH24MISS') < '120000' THEN '1' 
+                                            WHEN to_char(a.tstamp, 'HH24MISS') < '120000' THEN '1' 
                                             ELSE '2' 
                                         END AS AM_PM,
-                                        to_char(identified_tstamp, 'HH24MISS') AS HMS,
+                                        to_char(a.tstamp, 'HH24MISS') AS HMS,
                                         a.cow_id,
                                         b.cow_number,
                                         b.cow_name,
@@ -105,7 +105,7 @@ class DataWorker(QThread):
                                         ON a.milking_id = c.milking_id
                                     WHERE id_tag_number_assigned <> ''
                                       AND a.milking_id > :max_milking_id
-                                    ORDER BY a.milkingshift_id, a.identified_tstamp
+                                    ORDER BY a.milkingshift_id, a.tstamp
                         """)
                         result = pg_conn.execute(query, {"max_milking_id": max_milking_id})
                         data = result.fetchall()
@@ -125,29 +125,27 @@ class DataWorker(QThread):
                             "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
                             "percent_expected_milk"
                         ])
-                        start_mssql_time = time.time()
 
                         records = df.to_dict(orient='records')
                         with mssql_engine.connect() as conn:
-                            for i in range(0, len(records), 500):
+                            postgresql_complete_time = time.time() # PostgreSQL에서 데이터를 가져온 후, 완료 시점 시간 기록
+                            for i in range(0, len(records), 500):  # 500개씩 배치 처리
                                 batch = records[i:i + 500]
-                                conn.execute(text("""
-                                INSERT INTO ICT_MILKING_LOG (
-                                    milking_id, YMD, AM_PM, HMS, cow_id, cow_number, cow_name, milkingshift_id,
-                                    detacher_address, id_tag_number_assigned, milk_weight, dumped_milk,
-                                    milk_conductivity, cow_activity, flow_0_15_sec, flow_15_30_sec,
-                                    flow_30_60_sec, flow_60_120_sec, time_in_low_flow, reattach_counter,
-                                    percent_expected_milk
-                                ) VALUES (
-                                    :milking_id, :YMD, :AM_PM, :HMS, :cow_id, :cow_number, :cow_name, :milkingshift_id,
-                                    :detacher_address, :id_tag_number_assigned, :milk_weight, :dumped_milk,
-                                    :milk_conductivity, :cow_activity, :flow_0_15_sec, :flow_15_30_sec,
-                                    :flow_30_60_sec, :flow_60_120_sec, :time_in_low_flow, :reattach_counter,
-                                    :percent_expected_milk
-                                )
-                                """), batch)
-                            conn.commit()  # 커밋을 명시적으로 호출
-                        mssql_duration = time.time() - start_mssql_time
+                                for record in batch:  # 각 record를 저장 프로시저에 전달
+                                    conn.execute(text("""
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=:milking_id, @ymd=:YMD, @am_pm=:AM_PM, @hms=:HMS, @cow_id=:cow_id, 
+                                            @cow_number=:cow_number, @cow_name=:cow_name, @milkingshift_id=:milkingshift_id, 
+                                            @detacher_address=:detacher_address, @id_tag_number_assigned=:id_tag_number_assigned, 
+                                            @milk_weight=:milk_weight, @dumped_milk=:dumped_milk, @milk_conductivity=:milk_conductivity, 
+                                            @cow_activity=:cow_activity, @flow_0_15_sec=:flow_0_15_sec, @flow_15_30_sec=:flow_15_30_sec, 
+                                            @flow_30_60_sec=:flow_30_60_sec, @flow_60_120_sec=:flow_60_120_sec, 
+                                            @time_in_low_flow=:time_in_low_flow, @reattach_counter=:reattach_counter, 
+                                            @percent_expected_milk=:percent_expected_milk
+                                    """), record)
+                            conn.commit()  # 배치 처리 후 커밋
+
+                        mssql_duration = time.time() - postgresql_complete_time
                         self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
                         self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
                         logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
