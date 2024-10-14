@@ -1,0 +1,175 @@
+2024-10-10 10:15:04,160 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:15:04
+2024-10-10 10:15:06,579 - WARNING - SQLAlchemyError 발생: (sqlalchemy.exc.InvalidRequestError) A value is required for bind parameter 'supp_ymd'
+[SQL: 
+                                        EXEC InsertMilkingLog 
+                                            @milking_id=?, @ymd=?, @am_pm=?, @hms=?, @cow_id=?, 
+                                            @cow_number=?, @cow_name=?, @milkingshift_id=?, 
+                                            @detacher_address=?, @id_tag_number_assigned=?, 
+                                            @milk_weight=?, @dumped_milk=?, @milk_conductivity=?, 
+                                            @cow_activity=?, @flow_0_15_sec=?, @flow_15_30_sec=?, 
+                                            @flow_30_60_sec=?, @flow_60_120_sec=?, 
+                                            @time_in_low_flow=?, @reattach_counter=?, 
+                                            @percent_expected_milk=?, @supp_ymd=?
+                                    ]
+[parameters: [{'milking_id': 501339, 'YMD': '19700101', 'AM_PM': '1', 'HMS': '000000', 'cow_id': 284, 'cow_number': 560, 'cow_name': '', 'milkingshift_id': 3758, 'd ... (214 characters truncated) ...  0.15603088, 'flow_30_60_sec': 0.50510013, 'flow_60_120_sec': 1.3832744, 'time_in_low_flow': 59, 'reattach_counter': 0, 'percent_expected_milk': 99.0}]]
+(Background on this error at: https://sqlalche.me/e/20/cd3x), 1/3 재시도 중...
+2024-10-10 10:15:09,390 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 10:32:42,674 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:32:42
+2024-10-10 10:33:03,976 - INFO - 데이터 수집 종료 시간: 2024.10.10 10:33:03
+
+2024-10-10 10:33:03,977 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:33:03
+2024-10-10 10:33:06,632 - WARNING - SQLAlchemyError 발생: (pyodbc.IntegrityError) ('23000', "[23000] [Microsoft][ODBC SQL Server Driver][SQL Server]PRIMARY KEY 제약 조건 'PK_ICT_MILKING_ORG_LOG'을(를) 위반했습니다. 개체 'dbo.ICT_MILKING_ORG_LOG'에 중복 키를 삽입할 수 없습니다. 중복 키 값은 (501339)입니다. (2627) (SQLExecDirectW); [23000] [Microsoft][ODBC SQL Server Driver][SQL Server]문이 종료되었습니다. (3621)")
+[SQL: 
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=?, @ymd=?, @am_pm=?, @hms=?, @cow_id=?, 
+                                            @cow_number=?, @cow_name=?, @milkingshift_id=?, 
+                                            @detacher_address=?, @id_tag_number_assigned=?, 
+                                            @milk_weight=?, @dumped_milk=?, @milk_conductivity=?, 
+                                            @cow_activity=?, @flow_0_15_sec=?, @flow_15_30_sec=?, 
+                                            @flow_30_60_sec=?, @flow_60_120_sec=?, 
+                                            @time_in_low_flow=?, @reattach_counter=?, 
+                                            @percent_expected_milk=?
+                                    ]
+[parameters: (501339, '19700101', '1', '000000', 284, 560, '', 3758, 16, '200000000056163', Decimal('22.1'), Decimal('0.0'), 4.0, 0, 0.0, 0.15603088, 0.50510013, 1.3832744, 59, 0, 99.0)]
+(Background on this error at: https://sqlalche.me/e/20/gkpj), 1/3 재시도 중...
+2024-10-10 10:33:13,955 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:33:13
+2024-10-10 10:33:16,373 - WARNING - SQLAlchemyError 발생: (pyodbc.IntegrityError) ('23000', "[23000] [Microsoft][ODBC SQL Server Driver][SQL Server]PRIMARY KEY 제약 조건 'PK_ICT_MILKING_ORG_LOG'을(를) 위반했습니다. 개체 'dbo.ICT_MILKING_ORG_LOG'에 중복 키를 삽입할 수 없습니다. 중복 키 값은 (501339)입니다. (2627) (SQLExecDirectW); [23000] [Microsoft][ODBC SQL Server Driver][SQL Server]문이 종료되었습니다. (3621)")
+[SQL: 
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=?, @ymd=?, @am_pm=?, @hms=?, @cow_id=?, 
+                                            @cow_number=?, @cow_name=?, @milkingshift_id=?, 
+                                            @detacher_address=?, @id_tag_number_assigned=?, 
+                                            @milk_weight=?, @dumped_milk=?, @milk_conductivity=?, 
+                                            @cow_activity=?, @flow_0_15_sec=?, @flow_15_30_sec=?, 
+                                            @flow_30_60_sec=?, @flow_60_120_sec=?, 
+                                            @time_in_low_flow=?, @reattach_counter=?, 
+                                            @percent_expected_milk=?
+                                    ]
+[parameters: (501339, '19700101', '1', '000000', 284, 560, '', 3758, 16, '200000000056163', Decimal('22.1'), Decimal('0.0'), 4.0, 0, 0.0, 0.15603088, 0.50510013, 1.3832744, 59, 0, 99.0)]
+(Background on this error at: https://sqlalche.me/e/20/gkpj), 2/3 재시도 중...
+2024-10-10 10:33:17,263 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 10:37:06,256 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:37:06
+2024-10-10 10:37:08,707 - WARNING - SQLAlchemyError 발생: (pyodbc.IntegrityError) ('23000', "[23000] [Microsoft][ODBC SQL Server Driver][SQL Server]PRIMARY KEY 제약 조건 'PK_ICT_MILKING_ORG_LOG'을(를) 위반했습니다. 개체 'dbo.ICT_MILKING_ORG_LOG'에 중복 키를 삽입할 수 없습니다. 중복 키 값은 (501339)입니다. (2627) (SQLExecDirectW); [23000] [Microsoft][ODBC SQL Server Driver][SQL Server]문이 종료되었습니다. (3621)")
+[SQL: 
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=?, @ymd=?, @am_pm=?, @hms=?, @cow_id=?, 
+                                            @cow_number=?, @cow_name=?, @milkingshift_id=?, 
+                                            @detacher_address=?, @id_tag_number_assigned=?, 
+                                            @milk_weight=?, @dumped_milk=?, @milk_conductivity=?, 
+                                            @cow_activity=?, @flow_0_15_sec=?, @flow_15_30_sec=?, 
+                                            @flow_30_60_sec=?, @flow_60_120_sec=?, 
+                                            @time_in_low_flow=?, @reattach_counter=?, 
+                                            @percent_expected_milk=?
+                                    ]
+[parameters: (501339, '19700101', '1', '000000', 284, 560, '', 3758, 16, '200000000056163', Decimal('22.1'), Decimal('0.0'), 4.0, 0, 0.0, 0.15603088, 0.50510013, 1.3832744, 59, 0, 99.0)]
+(Background on this error at: https://sqlalche.me/e/20/gkpj), 1/3 재시도 중...
+2024-10-10 10:37:13,080 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 10:37:54,528 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:37:54
+2024-10-10 10:38:14,339 - INFO - 데이터 수집 종료 시간: 2024.10.10 10:38:14
+
+2024-10-10 10:38:24,490 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:38:24
+2024-10-10 10:38:50,862 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 10:41:45,671 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:41:45
+2024-10-10 10:42:08,018 - INFO - 데이터 수집 종료 시간: 2024.10.10 10:42:08
+
+2024-10-10 10:42:15,655 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:42:15
+2024-10-10 10:42:42,187 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 10:43:06,073 - INFO - 데이터 수집 시작 시간 : 2024.10.10 10:43:06
+2024-10-10 10:43:06,182 - INFO - 데이터 수집 종료 시간: 2024.10.10 10:43:06
+
+2024-10-10 10:43:13,751 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 11:22:31,622 - INFO - 데이터 수집 시작 시간 : 2024.10.10 11:22:31
+2024-10-10 11:22:34,090 - WARNING - SQLAlchemyError 발생: (pyodbc.IntegrityError) ('23000', "[23000] [Microsoft][ODBC SQL Server Driver][SQL Server]PRIMARY KEY 제약 조건 'PK_ICT_MILKING_ORG_LOG'을(를) 위반했습니다. 개체 'dbo.ICT_MILKING_ORG_LOG'에 중복 키를 삽입할 수 없습니다. 중복 키 값은 (501339)입니다. (2627) (SQLExecDirectW); [23000] [Microsoft][ODBC SQL Server Driver][SQL Server]문이 종료되었습니다. (3621)")
+[SQL: 
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=?, @ymd=?, @am_pm=?, @hms=?, @cow_id=?, 
+                                            @cow_number=?, @cow_name=?, @milkingshift_id=?, 
+                                            @detacher_address=?, @id_tag_number_assigned=?, 
+                                            @milk_weight=?, @dumped_milk=?, @milk_conductivity=?, 
+                                            @cow_activity=?, @flow_0_15_sec=?, @flow_15_30_sec=?, 
+                                            @flow_30_60_sec=?, @flow_60_120_sec=?, 
+                                            @time_in_low_flow=?, @reattach_counter=?, 
+                                            @percent_expected_milk=?
+                                    ]
+[parameters: (501339, '19700101', '1', '000000', 284, 560, '', 3758, 16, '200000000056163', Decimal('22.1'), Decimal('0.0'), 4.0, 0, 0.0, 0.15603088, 0.50510013, 1.3832744, 59, 0, 99.0)]
+(Background on this error at: https://sqlalche.me/e/20/gkpj), 1/3 재시도 중...
+2024-10-10 11:22:35,833 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 11:23:15,124 - INFO - 데이터 수집 시작 시간 : 2024.10.10 11:23:15
+2024-10-10 11:23:17,504 - WARNING - SQLAlchemyError 발생: (pyodbc.IntegrityError) ('23000', "[23000] [Microsoft][ODBC SQL Server Driver][SQL Server]PRIMARY KEY 제약 조건 'PK_ICT_MILKING_ORG_LOG'을(를) 위반했습니다. 개체 'dbo.ICT_MILKING_ORG_LOG'에 중복 키를 삽입할 수 없습니다. 중복 키 값은 (501339)입니다. (2627) (SQLExecDirectW); [23000] [Microsoft][ODBC SQL Server Driver][SQL Server]문이 종료되었습니다. (3621)")
+[SQL: 
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=?, @ymd=?, @am_pm=?, @hms=?, @cow_id=?, 
+                                            @cow_number=?, @cow_name=?, @milkingshift_id=?, 
+                                            @detacher_address=?, @id_tag_number_assigned=?, 
+                                            @milk_weight=?, @dumped_milk=?, @milk_conductivity=?, 
+                                            @cow_activity=?, @flow_0_15_sec=?, @flow_15_30_sec=?, 
+                                            @flow_30_60_sec=?, @flow_60_120_sec=?, 
+                                            @time_in_low_flow=?, @reattach_counter=?, 
+                                            @percent_expected_milk=?
+                                    ]
+[parameters: (501339, '19700101', '1', '000000', 284, 560, '', 3758, 16, '200000000056163', Decimal('22.1'), Decimal('0.0'), 4.0, 0, 0.0, 0.15603088, 0.50510013, 1.3832744, 59, 0, 99.0)]
+(Background on this error at: https://sqlalche.me/e/20/gkpj), 1/3 재시도 중...
+2024-10-10 11:23:23,080 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 11:24:16,923 - INFO - 데이터 수집 시작 시간 : 2024.10.10 11:24:16
+2024-10-10 11:24:17,132 - WARNING - SQLAlchemyError 발생: (psycopg2.errors.AmbiguousColumn) 오류:  칼럼 참조 "tstamp" 가 모호합니다.
+LINE 4:                                         to_char(tstamp, 'YYY...
+                                                        ^
+
+[SQL: 
+                                    SELECT 
+                                        a.milking_id,
+                                        to_char(tstamp, 'YYYYMMDD') AS YMD,
+                                        CASE 
+                                            WHEN to_char(tstamp, 'HH24MISS') < '120000' THEN '1' 
+                                            ELSE '2' 
+                                        END AS AM_PM,
+                                        to_char(tstamp, 'HH24MISS') AS HMS,
+                                        a.cow_id,
+                                        b.cow_number,
+                                        b.cow_name,
+                                        a.milkingshift_id,
+                                        detacher_address,
+                                        id_tag_number_assigned,
+                                        round(CAST(float8 (milk_weight * 0.45359) as numeric), 1) AS milk_weight,
+                                        round(CAST(float8 (dumped_milk * 0.45359) as numeric), 1) AS dumped_milk,
+                                        milk_conductivity,
+                                        cow_activity,
+                                        convertunits(c.flow_0_15_sec) AS flow_0_15_sec,
+                                        convertunits(c.flow_15_30_sec) AS flow_15_30_sec,
+                                        convertunits(c.flow_30_60_sec) AS flow_30_60_sec,
+                                        convertunits(c.flow_60_120_sec) AS flow_60_120_sec,
+                                        c.time_in_low_flow,
+                                        c.reattach_counter,
+                                        c.percent_expected_milk
+                                    FROM tblmilkings AS a
+                                    INNER JOIN public.vewcows AS b 
+                                        ON a.cow_id = b.cow_id
+                                    INNER JOIN public.tblstallperformances AS c 
+                                        ON a.milking_id = c.milking_id
+                                    WHERE id_tag_number_assigned <> ''
+                                      AND a.milking_id > %(max_milking_id)s
+                                    ORDER BY a.milkingshift_id, a.identified_tstamp
+                        ]
+[parameters: {'max_milking_id': 0}]
+(Background on this error at: https://sqlalche.me/e/20/f405), 1/3 재시도 중...
+2024-10-10 11:24:20,693 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 11:24:47,848 - INFO - 데이터 수집 시작 시간 : 2024.10.10 11:24:47
+2024-10-10 11:24:50,231 - WARNING - SQLAlchemyError 발생: (pyodbc.IntegrityError) ('23000', "[23000] [Microsoft][ODBC SQL Server Driver][SQL Server]PRIMARY KEY 제약 조건 'PK_ICT_MILKING_ORG_LOG'을(를) 위반했습니다. 개체 'dbo.ICT_MILKING_ORG_LOG'에 중복 키를 삽입할 수 없습니다. 중복 키 값은 (501339)입니다. (2627) (SQLExecDirectW); [23000] [Microsoft][ODBC SQL Server Driver][SQL Server]문이 종료되었습니다. (3621)")
+[SQL: 
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=?, @ymd=?, @am_pm=?, @hms=?, @cow_id=?, 
+                                            @cow_number=?, @cow_name=?, @milkingshift_id=?, 
+                                            @detacher_address=?, @id_tag_number_assigned=?, 
+                                            @milk_weight=?, @dumped_milk=?, @milk_conductivity=?, 
+                                            @cow_activity=?, @flow_0_15_sec=?, @flow_15_30_sec=?, 
+                                            @flow_30_60_sec=?, @flow_60_120_sec=?, 
+                                            @time_in_low_flow=?, @reattach_counter=?, 
+                                            @percent_expected_milk=?
+                                    ]
+[parameters: (501339, '20240610', '2', '164139', 284, 560, '', 3758, 16, '200000000056163', Decimal('22.1'), Decimal('0.0'), 4.0, 0, 0.0, 0.15603088, 0.50510013, 1.3832744, 59, 0, 99.0)]
+(Background on this error at: https://sqlalche.me/e/20/gkpj), 1/3 재시도 중...
+2024-10-10 11:24:54,429 - INFO - 중지 요청이 접수되었습니다.
+2024-10-10 11:25:14,829 - INFO - 데이터 수집 시작 시간 : 2024.10.10 11:25:14
+2024-10-10 11:25:36,304 - INFO - 데이터 수집 종료 시간: 2024.10.10 11:25:36
+
+2024-10-10 11:25:45,056 - INFO - 중지 요청이 접수되었습니다.

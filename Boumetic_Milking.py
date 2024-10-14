@@ -66,8 +66,8 @@ class DataWorker(QThread):
 
                     # MSSQL에서 최대 milking_id 값 조회
                     with mssql_engine.connect() as mssql_conn:
-                        max_milking_id = mssql_conn.execute(
-                            text("SELECT ISNULL(MAX(milking_id), 0) FROM ICT_MILKING_ORG_LOG WITH(NOLOCK)")
+                        max_tstamp = mssql_conn.execute(
+                            text("SELECT ISNULL(MAX(tstamp), CAST('1900-01-01 00:00:00.000000' AS DATETIME2(6)))  FROM ICT_MILKING_ORG_LOG WITH(NOLOCK)")
                         ).scalar()
 
                     # PostgreSQL에서 데이터 가져오기
@@ -97,17 +97,18 @@ class DataWorker(QThread):
                                         convertunits(c.flow_60_120_sec) AS flow_60_120_sec,
                                         c.time_in_low_flow,
                                         c.reattach_counter,
-                                        c.percent_expected_milk
+                                        c.percent_expected_milk,
+                                        to_char(a.tstamp, 'YYYY-MM-DD HH24:MI:SS.US') AS tstamp_string
                                     FROM tblmilkings AS a
                                     INNER JOIN public.vewcows AS b 
                                         ON a.cow_id = b.cow_id
-                                    INNER JOIN public.tblstallperformances AS c 
+                                     LEFT OUTER JOIN public.tblstallperformances AS c 
                                         ON a.milking_id = c.milking_id
                                     WHERE id_tag_number_assigned <> ''
-                                      AND a.milking_id > :max_milking_id
+                                      AND a.tstamp > :max_tstamp
                                     ORDER BY a.milkingshift_id, a.tstamp
                         """)
-                        result = pg_conn.execute(query, {"max_milking_id": max_milking_id})
+                        result = pg_conn.execute(query, {"max_tstamp": max_tstamp})
                         data = result.fetchall()
 
                     pg_row_count = len(data)
@@ -123,7 +124,7 @@ class DataWorker(QThread):
                             "detacher_address", "id_tag_number_assigned", "milk_weight", "dumped_milk",
                             "milk_conductivity", "cow_activity", "flow_0_15_sec", "flow_15_30_sec",
                             "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
-                            "percent_expected_milk"
+                            "percent_expected_milk", "tstamp_string"
                         ])
 
                         records = df.to_dict(orient='records')
@@ -141,7 +142,7 @@ class DataWorker(QThread):
                                             @cow_activity=:cow_activity, @flow_0_15_sec=:flow_0_15_sec, @flow_15_30_sec=:flow_15_30_sec, 
                                             @flow_30_60_sec=:flow_30_60_sec, @flow_60_120_sec=:flow_60_120_sec, 
                                             @time_in_low_flow=:time_in_low_flow, @reattach_counter=:reattach_counter, 
-                                            @percent_expected_milk=:percent_expected_milk
+                                            @percent_expected_milk=:percent_expected_milk, @tstamp=:tstamp_string
                                     """), record)
                             conn.commit()  # 배치 처리 후 커밋
 
