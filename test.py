@@ -5,14 +5,13 @@ import logging
 from logging.handlers import TimedRotatingFileHandler
 import time
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, \
-    QLabel, QLineEdit, QSystemTrayIcon, QMenu, QAction
+    QLabel, QLineEdit, QSystemTrayIcon, QMenu, QAction, QProgressBar
 from PyQt5.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker, Qt
 from PyQt5.QtGui import QIcon
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError, OperationalError, TimeoutError
 from datetime import datetime
 from PyQt5.QtCore import QTime
-
 
 # 리소스 파일에 접근할 수 있도록 경로 설정 함수
 def resource_path(relative_path):
@@ -23,7 +22,7 @@ def resource_path(relative_path):
     return os.path.join(base_path, relative_path)
 
 # 로그 파일 이름 고정
-log_file_name = "data_milking.log"
+log_file_name = "data_activity.log"
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
 log_handler.setFormatter(log_formatter)
@@ -34,13 +33,13 @@ logger.addHandler(log_handler)
 
 # PostgreSQL 및 MSSQL 연결 설정
 pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
-#pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
 mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
 pg_engine = create_engine(pg_connection_string)
 mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
 
 class DataWorker(QThread):
     update_text = pyqtSignal(str)
+    update_progress = pyqtSignal(int)  # 프로그레스바 업데이트 신호
     finished = pyqtSignal()
 
     def __init__(self, interval):
@@ -66,48 +65,29 @@ class DataWorker(QThread):
 
                     # MSSQL에서 최대 milking_id 값 조회
                     with mssql_engine.connect() as mssql_conn:
-                        max_milking_id = mssql_conn.execute(
-                            text("SELECT ISNULL(MAX(milking_id), 0) FROM ICT_MILKING_ORG_LOG")
+                        max_activity_id = mssql_conn.execute(
+                            text("SELECT ISNULL(MAX(cowactivity_id), 0) FROM ICT_ACTIVITY_LOG")
                         ).scalar()
 
                     # PostgreSQL에서 데이터 가져오기
                     with pg_engine.connect() as pg_conn:
                         query = text("""
-                                    SELECT 
-                                        a.milking_id,
-                                        to_char(a.tstamp, 'YYYYMMDD') AS YMD,
-                                        CASE 
-                                            WHEN to_char(a.tstamp, 'HH24MISS') < '120000' THEN '1' 
-                                            ELSE '2' 
-                                        END AS AM_PM,
-                                        to_char(a.tstamp, 'HH24MISS') AS HMS,
-                                        a.cow_id,
-                                        b.cow_number,
-                                        b.cow_name,
-                                        a.milkingshift_id,
-                                        detacher_address,
-                                        id_tag_number_assigned,
-                                        round(CAST(float8 (milk_weight * 0.45359) as numeric), 1) AS milk_weight,
-                                        round(CAST(float8 (dumped_milk * 0.45359) as numeric), 1) AS dumped_milk,
-                                        milk_conductivity,
-                                        cow_activity,
-                                        convertunits(c.flow_0_15_sec) AS flow_0_15_sec,
-                                        convertunits(c.flow_15_30_sec) AS flow_15_30_sec,
-                                        convertunits(c.flow_30_60_sec) AS flow_30_60_sec,
-                                        convertunits(c.flow_60_120_sec) AS flow_60_120_sec,
-                                        c.time_in_low_flow,
-                                        c.reattach_counter,
-                                        c.percent_expected_milk
-                                    FROM tblmilkings AS a
-                                    INNER JOIN public.vewcows AS b 
+                                SELECT a.cowactivity_id
+                                     , a.cow_id
+                                     , b.cow_number
+                                     , b.cow_name
+                                     , a.counts
+                                     , a.counts_perhr
+                                     , a.cow_activity
+                                     , to_char(a.tstamp, 'YYYYMMDD') AS ymd
+                                     , to_char(a.tstamp, 'HH24MISS') AS hms
+                                  FROM tblcowactivities a
+                                 INNER JOIN tblcows b
                                         ON a.cow_id = b.cow_id
-                                    INNER JOIN public.tblstallperformances AS c 
-                                        ON a.milking_id = c.milking_id
-                                    WHERE id_tag_number_assigned <> ''
-                                      AND a.milking_id > :max_milking_id
-                                    ORDER BY a.milkingshift_id, a.identified_tstamp
+                                where a.cowactivity_id > :max_activity_id
+                                order by a.cow_id, cowactivity_id;
                         """)
-                        result = pg_conn.execute(query, {"max_milking_id": max_milking_id})
+                        result = pg_conn.execute(query, {"max_activity_id": max_activity_id})
                         data = result.fetchall()
 
                     pg_row_count = len(data)
@@ -118,31 +98,25 @@ class DataWorker(QThread):
                         self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
                     else:
                         # 데이터프레임으로 변환
-                        df = pd.DataFrame(data, columns=[
-                            "milking_id", "YMD", "AM_PM", "HMS", "cow_id", "cow_number", "cow_name", "milkingshift_id",
-                            "detacher_address", "id_tag_number_assigned", "milk_weight", "dumped_milk",
-                            "milk_conductivity", "cow_activity", "flow_0_15_sec", "flow_15_30_sec",
-                            "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
-                            "percent_expected_milk"
-                        ])
-
+                        df = pd.DataFrame(data, columns=["cowactivity_id", "cow_id", "cow_number", "cow_name", "counts", "counts_perhr", "cow_activity", "ymd", "hms"])
+                        total_records = len(df)
                         records = df.to_dict(orient='records')
+
                         with mssql_engine.connect() as conn:
                             postgresql_complete_time = time.time() # PostgreSQL에서 데이터를 가져온 후, 완료 시점 시간 기록
                             for i in range(0, len(records), 500):  # 500개씩 배치 처리
                                 batch = records[i:i + 500]
                                 for record in batch:  # 각 record를 저장 프로시저에 전달
                                     conn.execute(text("""
-                                        EXEC P_ICT_MILKING_ORG_LOG_M 
-                                            @milking_id=:milking_id, @ymd=:YMD, @am_pm=:AM_PM, @hms=:HMS, @cow_id=:cow_id, 
-                                            @cow_number=:cow_number, @cow_name=:cow_name, @milkingshift_id=:milkingshift_id, 
-                                            @detacher_address=:detacher_address, @id_tag_number_assigned=:id_tag_number_assigned, 
-                                            @milk_weight=:milk_weight, @dumped_milk=:dumped_milk, @milk_conductivity=:milk_conductivity, 
-                                            @cow_activity=:cow_activity, @flow_0_15_sec=:flow_0_15_sec, @flow_15_30_sec=:flow_15_30_sec, 
-                                            @flow_30_60_sec=:flow_30_60_sec, @flow_60_120_sec=:flow_60_120_sec, 
-                                            @time_in_low_flow=:time_in_low_flow, @reattach_counter=:reattach_counter, 
-                                            @percent_expected_milk=:percent_expected_milk
+                                        EXEC P_ICT_ACTIVITY_LOG_M 
+                                            @cowactivity_id=:cowactivity_id, @cow_id=:cow_id, @cow_number=:cow_number, @cow_name=:cow_name, @counts=:counts, 
+                                            @counts_perhr=:counts_perhr, @cow_activity=:cow_activity, @ymd=:ymd,@hms=:hms
                                     """), record)
+
+                                # 프로그레스바 업데이트
+                                progress = int((i + len(batch)) / total_records * 100)
+                                self.update_progress.emit(progress)
+
                             conn.commit()  # 배치 처리 후 커밋
 
                         mssql_duration = time.time() - postgresql_complete_time
@@ -151,23 +125,10 @@ class DataWorker(QThread):
                         logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
                     break  # 재시도 성공 시 루프 탈출
 
-                # 구체적인 예외 처리 추가
-                except OperationalError as e:
+                except (OperationalError, TimeoutError, SQLAlchemyError) as e:
                     retries += 1
-                    self.update_text.emit(f"-> OperationalError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"OperationalError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
-                    time.sleep(retry_delay)
-
-                except TimeoutError as e:
-                    retries += 1
-                    self.update_text.emit(f"-> TimeoutError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"TimeoutError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
-                    time.sleep(retry_delay)
-
-                except SQLAlchemyError as e:
-                    retries += 1
-                    self.update_text.emit(f"-> SQLAlchemyError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"SQLAlchemyError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
+                    self.update_text.emit(f"-> {type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
+                    logger.warning(f"{type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
                     time.sleep(retry_delay)
 
                 finally:
@@ -189,16 +150,15 @@ class DataWorker(QThread):
         logger.info("중지 요청이 접수되었습니다.")
 
 from PyQt5.QtCore import QTimer
-
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("보우메틱 착유량")
+        self.setWindowTitle("보우메틱 활동량")
         self.setGeometry(300, 300, 500, 500)
 
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
 
-        icon_path = resource_path("milking.png")
+        icon_path = resource_path("activity.png")
         self.tray_icon = QSystemTrayIcon(self)
         self.tray_icon.setIcon(QIcon(icon_path))
 
@@ -227,7 +187,6 @@ class MainWindow(QMainWindow):
         self.am_start_minute_input.setFixedWidth(30)
         self.am_start_minute_input.setPlaceholderText("분")
 
-        # 오전 시작 시간 기본값 6:00
         self.am_start_hour_input.setText("06")
         self.am_start_minute_input.setText("00")
 
@@ -239,8 +198,6 @@ class MainWindow(QMainWindow):
         self.am_end_minute_input = QLineEdit(self)
         self.am_end_minute_input.setFixedWidth(30)
         self.am_end_minute_input.setPlaceholderText("분")
-
-        # 오전 종료 시간 기본값 10:00
         self.am_end_hour_input.setText("10")
         self.am_end_minute_input.setText("00")
 
@@ -253,7 +210,6 @@ class MainWindow(QMainWindow):
         self.pm_start_minute_input.setFixedWidth(30)
         self.pm_start_minute_input.setPlaceholderText("분")
 
-        # 오후 시작 시간 기본값 15:00
         self.pm_start_hour_input.setText("15")
         self.pm_start_minute_input.setText("00")
 
@@ -266,7 +222,6 @@ class MainWindow(QMainWindow):
         self.pm_end_minute_input.setFixedWidth(30)
         self.pm_end_minute_input.setPlaceholderText("분")
 
-        # 오후 종료 시간 기본값 19:00
         self.pm_end_hour_input.setText("19")
         self.pm_end_minute_input.setText("00")
 
@@ -304,6 +259,12 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.clicked.connect(self.stop_data_collection)
 
+        # Progress bar 추가
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setValue(0)  # 초기값 0 설정
+        self.progress_bar.setAlignment(Qt.AlignCenter)
+        self.progress_bar.setFixedHeight(30)  # 프로그레스바 높이 설정
+
         controls_layout = QHBoxLayout()
         controls_layout.addWidget(self.interval_label)
         controls_layout.addWidget(self.interval_input)
@@ -312,15 +273,16 @@ class MainWindow(QMainWindow):
 
         # 문구를 위한 QLabel 추가
         self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.", self)
-        self.info_label.setStyleSheet("color: red;")  # 스타일을 추가해 강조
-        self.info_label.setFixedHeight(30)  # 라벨 높이 조절 (30픽셀로 고정)
-        self.info_label.setContentsMargins(0, 0, 10, 10)  # 여백 설정 (좌, 상, 우, 하)
+        self.info_label.setStyleSheet("color: red;")
+        self.info_label.setFixedHeight(30)
+        self.info_label.setContentsMargins(0, 0, 10, 10)
 
         # 기존 레이아웃에 추가
         layout = QVBoxLayout()
-        layout.addWidget(self.info_label)  # 문구를 상단에 추가
-        layout.addLayout(time_layout)  # 시간을 입력하는 레이아웃을 그 다음에 추가
+        layout.addWidget(self.info_label)
+        layout.addLayout(time_layout)
         layout.addWidget(self.text_edit)
+        layout.addWidget(self.progress_bar)  # Progress bar 추가
         layout.addLayout(controls_layout)
 
         container = QWidget()
@@ -334,53 +296,38 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.check_time_for_auto_start_stop)
         self.timer.start(60000)
 
-        # 프로그램 실행 후 바로 시간 체크를 한 번 호출
-        self.check_time_for_auto_start_stop()  # <-- 이 부분 추가
+        self.check_time_for_auto_start_stop()
 
     def check_time_for_auto_start_stop(self):
         current_time = QTime.currentTime()
-
-        # 입력된 오전 시작 시간
         am_start_hour = int(self.am_start_hour_input.text())
         am_start_minute = int(self.am_start_minute_input.text())
-
-        # 입력된 오전 종료 시간
         am_end_hour = int(self.am_end_hour_input.text())
         am_end_minute = int(self.am_end_minute_input.text())
-
-        # 입력된 오후 시작 시간
         pm_start_hour = int(self.pm_start_hour_input.text())
         pm_start_minute = int(self.pm_start_minute_input.text())
-
-        # 입력된 오후 종료 시간
         pm_end_hour = int(self.pm_end_hour_input.text())
         pm_end_minute = int(self.pm_end_minute_input.text())
 
-        # 현재 시간이 오전 시작 시간과 종료 시간 사이일 때만 작업 시작
         if (current_time.hour() > am_start_hour or (
                 current_time.hour() == am_start_hour and current_time.minute() >= am_start_minute)) and \
                 (current_time.hour() < am_end_hour or (
                         current_time.hour() == am_end_hour and current_time.minute() < am_end_minute)):
-            # 오전 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
             if not self.worker or not self.worker.isRunning():
                 self.start_data_collection()
 
-        # 현재 시간이 오후 시작 시간과 종료 시간 사이일 때만 작업 시작
         elif (current_time.hour() > pm_start_hour or (
                 current_time.hour() == pm_start_hour and current_time.minute() >= pm_start_minute)) and \
                 (current_time.hour() < pm_end_hour or (
                         current_time.hour() == pm_end_hour and current_time.minute() < pm_end_minute)):
-            # 오후 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
             if not self.worker or not self.worker.isRunning():
                 self.start_data_collection()
 
-        # 현재 시간이 오전 종료 시간을 지났을 경우 멈춤
         elif current_time.hour() > am_end_hour or (
                 current_time.hour() == am_end_hour and current_time.minute() >= am_end_minute):
             if self.worker and self.worker.isRunning():
                 self.stop_data_collection()
 
-        # 현재 시간이 오후 종료 시간을 지났을 경우 멈춤
         elif current_time.hour() > pm_end_hour or (
                 current_time.hour() == pm_end_hour and current_time.minute() >= pm_end_minute):
             if self.worker and self.worker.isRunning():
@@ -416,6 +363,7 @@ class MainWindow(QMainWindow):
 
         self.worker = DataWorker(interval)
         self.worker.update_text.connect(self.append_text)
+        self.worker.update_progress.connect(self.update_progress)  # Progress bar 업데이트 연결
         self.worker.finished.connect(self.on_data_collection_finished)
         self.worker.start()
 
@@ -431,7 +379,6 @@ class MainWindow(QMainWindow):
     def append_text(self, text):
         self.text_edit.append(text)
         self.text_edit.ensureCursorVisible()
-
         max_lines = 500
         if self.text_edit.document().blockCount() > max_lines:
             cursor = self.text_edit.textCursor()
@@ -440,9 +387,13 @@ class MainWindow(QMainWindow):
             cursor.removeSelectedText()
             cursor.deleteChar()
 
+    # Progress bar 업데이트
+    def update_progress(self, value):
+        self.progress_bar.setValue(value)
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-    icon_path = resource_path("milking.png")
+    icon_path = resource_path("activity.png")
     app.setWindowIcon(QIcon(icon_path))
     window = MainWindow()
     window.show()

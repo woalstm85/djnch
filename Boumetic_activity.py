@@ -98,19 +98,23 @@ class DataWorker(QThread):
                     if pg_row_count == 0:
                         self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
                     else:
+                        # 데이터프레임으로 변환
                         df = pd.DataFrame(data, columns=["cowactivity_id", "cow_id", "cow_number", "cow_name", "counts", "counts_perhr", "cow_activity", "ymd", "hms"])
-                        start_mssql_time = time.time()
 
                         records = df.to_dict(orient='records')
                         with mssql_engine.connect() as conn:
-                            for i in range(0, len(records), 500):
+                            postgresql_complete_time = time.time() # PostgreSQL에서 데이터를 가져온 후, 완료 시점 시간 기록
+                            for i in range(0, len(records), 500):  # 500개씩 배치 처리
                                 batch = records[i:i + 500]
-                                conn.execute(text("""
-                                INSERT INTO ICT_ACTIVITY_LOG (cowactivity_id, cow_id, cow_number, cow_name, counts, counts_perhr, cow_activity, ymd, hms
-                                ) VALUES (:cowactivity_id, :cow_id, :cow_number, :cow_name, :counts, :counts_perhr, :cow_activity, :ymd, :hms)
-                                """), batch)
-                            conn.commit()  # 커밋을 명시적으로 호출
-                        mssql_duration = time.time() - start_mssql_time
+                                for record in batch:  # 각 record를 저장 프로시저에 전달
+                                    conn.execute(text("""
+                                        EXEC P_ICT_ACTIVITY_LOG_M 
+                                            @cowactivity_id=:cowactivity_id, @cow_id=:cow_id, @cow_number=:cow_number, @cow_name=:cow_name, @counts=:counts, 
+                                            @counts_perhr=:counts_perhr, @cow_activity=:cow_activity, @ymd=:ymd,@hms=:hms
+                                    """), record)
+                            conn.commit()  # 배치 처리 후 커밋
+
+                        mssql_duration = time.time() - postgresql_complete_time
                         self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
                         self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
                         logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
@@ -154,12 +158,11 @@ class DataWorker(QThread):
         logger.info("중지 요청이 접수되었습니다.")
 
 from PyQt5.QtCore import QTimer
-from PyQt5.QtCore import QTimer
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("보우메틱 활동량_log")
+        self.setWindowTitle("보우메틱 활동량")
         self.setGeometry(300, 300, 500, 500)
 
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
@@ -257,7 +260,7 @@ class MainWindow(QMainWindow):
         self.interval_label = QLabel("수집주기 (초):", self)
         self.interval_input = QLineEdit(self)
         self.interval_input.setFixedWidth(50)
-        self.interval_input.setText("10")
+        self.interval_input.setText("120")
 
         self.start_button = QPushButton("데이터 수집 시작", self)
         self.start_button.setFixedWidth(300)

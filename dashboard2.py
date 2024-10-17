@@ -1,93 +1,130 @@
-import sys
-import pandas as pd
-import matplotlib.pyplot as plt
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
-from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from PyQt5.QtCore import QTimer
-from sqlalchemy import create_engine
-
-# MSSQL connection string
-mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
-mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
+import tkinter as tk
+import cv2
+from PIL import Image, ImageTk
+import threading
+import requests
+import numpy as np
+import random
 
 
-# 데이터베이스에서 데이터를 가져오는 함수
-def get_data():
-    query = """
-        SELECT YMD, COW_NO, SUM(milk_weight) as milk_weight
-        FROM ICT_MILKING_LOG WITH(NOLOCK)
-        WHERE YMD = CONVERT(char(8), GETDATE(), 112)
-        GROUP BY YMD, COW_NO
-        ORDER BY YMD, COW_NO
-    """
-    df = pd.read_sql(query, mssql_engine)
-    return df
+# CCTV 데이터를 가져오는 함수
+def get_cctv_url(lat, lng):
+    minX = str(lng - 1)
+    maxX = str(lng + 1)
+    minY = str(lat - 1)
+    maxY = str(lat + 1)
+
+    api_call = 'https://openapi.its.go.kr:9443/cctvInfo?' \
+               'apiKey=4d4c2f232c914418b8a370f0f08eb584' \
+               '&type=ex&cctvType=2' \
+               '&minX=' + minX + \
+               '&maxX=' + maxX + \
+               '&minY=' + minY + \
+               '&maxY=' + maxY + \
+               '&getType=json'
+
+    try:
+        w_dataset = requests.get(api_call).json()
+        cctv_data = w_dataset['response']['data']
+    except (KeyError, requests.RequestException) as e:
+        print("Error fetching CCTV data:", e)
+        return None
+
+    coordx_list = []
+    for index, data in enumerate(cctv_data):
+        xy_couple = (float(cctv_data[index]['coordy']), float(cctv_data[index]['coordx']))
+        coordx_list.append(xy_couple)
+
+    coordx_list = np.array(coordx_list)
+    leftbottom = np.array((lat, lng))
+    distances = np.linalg.norm(coordx_list - leftbottom, axis=1)
+    min_index = np.argmin(distances)
+
+    return cctv_data[min_index] if cctv_data else None
 
 
-# 막대 차트를 그리는 함수
-def draw_chart(df, ax):
-    df['YMD'] = pd.to_datetime(df['YMD'], format='%Y%m%d').dt.strftime('%Y.%m.%d')
-    latest_date = df['YMD'].unique()[0]
-
-    # 차트 그리기
-    ax.clear()
-    ax.bar(df['COW_NO'], df['milk_weight'], color=plt.colormaps.get_cmap('tab20').colors)  # 막대 차트
-    ax.set_title(f'Milk Weight by Cow ({latest_date})', fontsize=14)
-    ax.set_xlabel('Cow Number')
-    ax.set_ylabel('Weight')
-    ax.tick_params(axis='x', rotation=45)
-
-    # 값 표시
-    for idx, value in enumerate(df['milk_weight']):
-        ax.text(idx, value, f'{value:.2f}', ha='center', va='bottom')
+# 임의의 좌표 리스트 (6개)
+coordinates = [
+    (36.58629, 128.186793),
+    (37.5665, 126.9780),  # 서울
+    (35.1796, 129.0756),  # 부산
+    (37.4563, 126.7052),  # 인천
+    (35.8722, 128.6025),  # 대구
+    (35.1595, 126.8526),  # 광주
+]
 
 
-# PyQt5 창 생성
-class App(QMainWindow):
-    def __init__(self):
-        super().__init__()
+# 두 개의 CCTV를 번갈아 가며 표시하는 함수
+def switch_cctv(cctv_labels, cctv_data_list, root):
+    def update():
+        # 두 개의 CCTV 선택
+        cctv_data1 = random.choice(cctv_data_list)
+        cctv_data2 = random.choice(cctv_data_list)
 
-        self.setWindowTitle('Milk Weight by Cow')
-        self.setGeometry(100, 100, 800, 600)
+        # CCTV 스트림 URL을 사용하여 화면 표시
+        update_cctv_frame(cctv_labels[0], cctv_data1['cctvurl'])
+        update_cctv_frame(cctv_labels[1], cctv_data2['cctvurl'])
 
-        # 레이아웃 설정
-        self.widget = QWidget()
-        self.setCentralWidget(self.widget)
-        self.layout = QVBoxLayout(self.widget)
+        root.after(10000, update)  # 10초마다 호출
 
-        # matplotlib FigureCanvas 생성
-        self.figure, self.ax = plt.subplots()
-        self.canvas = FigureCanvas(self.figure)
-        self.layout.addWidget(self.canvas)
-
-        # 데이터 관련 변수
-        self.df = get_data()
-        self.current_start_index = 0
-
-        # 타이머 설정 (10초마다 차트 갱신)
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_chart)
-        self.timer.start(10000)  # 10000 밀리초 = 10초
-
-        # 첫 차트 그리기
-        self.update_chart()
-
-    def update_chart(self):
-        # 데이터를 30개씩 슬라이싱
-        start_index = self.current_start_index
-        end_index = start_index + 30
-        sliced_df = self.df.iloc[start_index:end_index]
-
-        # 차트 업데이트
-        draw_chart(sliced_df, self.ax)
-        self.canvas.draw()
-
-        # 인덱스 갱신 (순환)
-        self.current_start_index = (self.current_start_index + 30) % len(self.df)
+    update()
 
 
-if __name__ == '__main__':
-    app = QApplication(sys.argv)
-    main_window = App()
-    main_window.show()
-    sys.exit(app.exec_())
+# CCTV 화면을 업데이트하는 함수
+def update_cctv_frame(frame_label, cctv_url):
+    cap = cv2.VideoCapture(cctv_url)  # CCTV 스트림 열기
+    if not cap.isOpened():
+        print(f"Cannot open stream: {cctv_url}")
+        return
+
+    def stream():
+        ret, frame = cap.read()
+        if ret:
+            frame = cv2.resize(frame, (320, 240))
+            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img_pil = Image.fromarray(img)
+            imgtk = ImageTk.PhotoImage(image=img_pil)
+            frame_label.imgtk = imgtk
+            frame_label.configure(image=imgtk)  # Label에 이미지를 업데이트
+        frame_label.after(50, stream)  # 50ms마다 프레임 갱신 (20fps 정도)
+
+    # 50ms마다 새로운 프레임을 읽어오기
+    frame_label.after(50, stream)
+
+
+# Tkinter로 GUI 생성
+def create_gui(cctv_data_list):
+    root = tk.Tk()
+    root.title("CCTV Viewer")
+
+    # CCTV 영역
+    cctv_frame = tk.Frame(root)
+    cctv_frame.pack(side=tk.LEFT)
+
+    cctv_labels = []
+
+    # CCTV 화면 2개
+    for i in range(2):
+        cctv_label = tk.Label(cctv_frame)
+        cctv_label.pack(pady=10)
+        cctv_labels.append(cctv_label)
+
+    # 10초마다 CCTV 화면 변경
+    switch_cctv(cctv_labels, cctv_data_list, root)
+
+    root.mainloop()
+
+
+# CCTV 데이터를 가져와서 리스트에 저장
+cctv_data_list = []
+for lat, lng in coordinates:
+    cctv_data = get_cctv_url(lat, lng)
+    if cctv_data:
+        cctv_data_list.append(cctv_data)
+
+# GUI 생성 및 시작
+if __name__ == "__main__":
+    if cctv_data_list:
+        create_gui(cctv_data_list)
+    else:
+        print("No CCTV data available.")

@@ -100,9 +100,9 @@ class DataWorker(QThread):
                                         c.percent_expected_milk,
                                         to_char(a.tstamp, 'YYYY-MM-DD HH24:MI:SS.US') AS tstamp_string
                                     FROM tblmilkings AS a
-                                    INNER JOIN public.vewcows AS b 
+                                    LEFT OUTER JOIN public.vewcows AS b 
                                         ON a.cow_id = b.cow_id
-                                     LEFT OUTER JOIN public.tblstallperformances AS c 
+                                    LEFT OUTER JOIN public.tblstallperformances AS c 
                                         ON a.milking_id = c.milking_id
                                     WHERE id_tag_number_assigned <> ''
                                       AND a.tstamp > :max_tstamp
