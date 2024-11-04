@@ -1,400 +1,249 @@
-import sys
-import os
-import pandas as pd
-import logging
-from logging.handlers import TimedRotatingFileHandler
-import time
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, \
-    QLabel, QLineEdit, QSystemTrayIcon, QMenu, QAction, QProgressBar
-from PyQt5.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker, Qt
-from PyQt5.QtGui import QIcon
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError, OperationalError, TimeoutError
-from datetime import datetime
-from PyQt5.QtCore import QTime
+import sys  # 시스템 관련 기능을 사용하기 위한 모듈
+import pandas as pd  # 데이터 분석 및 조작을 위한 라이브러리
+import plotly.graph_objects as go  # Plotly를 사용하여 대화형 차트를 생성하기 위한 모듈
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QHBoxLayout, QPushButton  # PyQt5의 GUI 구성 요소
+from PyQt5.QtCore import QTimer  # PyQt5에서 타이머 기능을 사용하기 위한 모듈
+from PyQt5.QtWebEngineWidgets import QWebEngineView  # PyQt5에서 웹 콘텐츠를 표시하기 위한 모듈
+from sqlalchemy import create_engine  # 데이터베이스 연결을 설정하기 위한 SQLAlchemy의 모듈
 
-# 리소스 파일에 접근할 수 있도록 경로 설정 함수
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
-
-# 로그 파일 이름 고정
-log_file_name = "data_activity.log"
-log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
-log_handler.setFormatter(log_formatter)
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-logger.addHandler(log_handler)
-
-# PostgreSQL 및 MSSQL 연결 설정
-pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
+# MSSQL 데이터베이스 연결 문자열 설정
 mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
-pg_engine = create_engine(pg_connection_string)
-mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
+mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)  # 데이터베이스 엔진 생성
 
-class DataWorker(QThread):
-    update_text = pyqtSignal(str)
-    update_progress = pyqtSignal(int)  # 프로그레스바 업데이트 신호
-    finished = pyqtSignal()
-
-    def __init__(self, interval):
-        super().__init__()
-        self.interval = interval
-        self.stop_requested = False
-        self.mutex = QMutex()
-
-    def run(self):
-        max_retries = 3  # 최대 재시도 횟수
-        retry_delay = 5  # 재시도 대기 시간 (초)
-
-        while not self.stop_requested:
-            start_time = time.time()
-            retries = 0  # 현재 재시도 횟수 초기화
-
-            while retries <= max_retries and not self.stop_requested:
-                try:
-                    start_time_display = datetime.now().strftime('%Y.%m.%d %H:%M:%S')
-                    self.update_text.emit(f"***********************************************\n")
-                    self.update_text.emit(f"-> 데이터 수집 시작 시간 : {start_time_display}\n")
-                    logger.info(f"데이터 수집 시작 시간 : {start_time_display}")
-
-                    # MSSQL에서 최대 milking_id 값 조회
-                    with mssql_engine.connect() as mssql_conn:
-                        max_activity_id = mssql_conn.execute(
-                            text("SELECT ISNULL(MAX(cowactivity_id), 0) FROM ICT_ACTIVITY_LOG")
-                        ).scalar()
-
-                    # PostgreSQL에서 데이터 가져오기
-                    with pg_engine.connect() as pg_conn:
-                        query = text("""
-                                SELECT a.cowactivity_id
-                                     , a.cow_id
-                                     , b.cow_number
-                                     , b.cow_name
-                                     , a.counts
-                                     , a.counts_perhr
-                                     , a.cow_activity
-                                     , to_char(a.tstamp, 'YYYYMMDD') AS ymd
-                                     , to_char(a.tstamp, 'HH24MISS') AS hms
-                                  FROM tblcowactivities a
-                                 INNER JOIN tblcows b
-                                        ON a.cow_id = b.cow_id
-                                where a.cowactivity_id > :max_activity_id
-                                order by a.cow_id, cowactivity_id;
-                        """)
-                        result = pg_conn.execute(query, {"max_activity_id": max_activity_id})
-                        data = result.fetchall()
-
-                    pg_row_count = len(data)
-                    pg_duration = time.time() - start_time
-                    self.update_text.emit(f"-> PostgreSQL 데이터 건수: {pg_row_count}건 / {pg_duration:.2f}초\n")
-
-                    if pg_row_count == 0:
-                        self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
-                    else:
-                        # 데이터프레임으로 변환
-                        df = pd.DataFrame(data, columns=["cowactivity_id", "cow_id", "cow_number", "cow_name", "counts", "counts_perhr", "cow_activity", "ymd", "hms"])
-                        total_records = len(df)
-                        records = df.to_dict(orient='records')
-
-                        with mssql_engine.connect() as conn:
-                            postgresql_complete_time = time.time() # PostgreSQL에서 데이터를 가져온 후, 완료 시점 시간 기록
-                            for i in range(0, len(records), 500):  # 500개씩 배치 처리
-                                batch = records[i:i + 500]
-                                for record in batch:  # 각 record를 저장 프로시저에 전달
-                                    conn.execute(text("""
-                                        EXEC P_ICT_ACTIVITY_LOG_M 
-                                            @cowactivity_id=:cowactivity_id, @cow_id=:cow_id, @cow_number=:cow_number, @cow_name=:cow_name, @counts=:counts, 
-                                            @counts_perhr=:counts_perhr, @cow_activity=:cow_activity, @ymd=:ymd,@hms=:hms
-                                    """), record)
-
-                                # 프로그레스바 업데이트
-                                progress = int((i + len(batch)) / total_records * 100)
-                                self.update_progress.emit(progress)
-
-                            conn.commit()  # 배치 처리 후 커밋
-
-                        mssql_duration = time.time() - postgresql_complete_time
-                        self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
-                        self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
-                        logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
-                    break  # 재시도 성공 시 루프 탈출
-
-                except (OperationalError, TimeoutError, SQLAlchemyError) as e:
-                    retries += 1
-                    self.update_text.emit(f"-> {type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"{type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
-                    time.sleep(retry_delay)
-
-                finally:
-                    end_time = time.time()
-                    elapsed_time = end_time - start_time
-                    remaining_time = self.interval - elapsed_time
-                    if remaining_time > 0:
-                        for _ in range(int(remaining_time / 0.1)):
-                            if self.stop_requested:
-                                break
-                            time.sleep(0.1)
-
-        self.finished.emit()
-
-    def stop(self):
-        with QMutexLocker(self.mutex):
-            self.stop_requested = True
-        self.update_text.emit("-> 중지 요청이 접수되었습니다... 중지 중입니다...\n")
-        logger.info("중지 요청이 접수되었습니다.")
-
-from PyQt5.QtCore import QTimer
-class MainWindow(QMainWindow):
+class MilkWeightApp(QMainWindow):  # PyQt5의 QMainWindow 클래스를 상속받아 애플리케이션 정의
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("보우메틱 활동량")
-        self.setGeometry(300, 300, 500, 500)
+        self.setWindowTitle("Milk Weight Chart")  # 창 제목 설정
 
-        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
+        # 종료 버튼 생성 및 스타일 설정
+        self.exit_button = QPushButton("종료")
+        self.exit_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: black;
+                border: 1px solid black;
+                padding: 5px;
+            }
+            QPushButton:hover {
+                background-color: #FFCCCC;
+            }
+        """)
+        self.exit_button.clicked.connect(self.close_application)  # 버튼 클릭 시 애플리케이션 종료
 
-        icon_path = resource_path("activity.png")
-        self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon(icon_path))
+        # 차트 자동 업데이트를 위한 타이머 설정 (10초마다 update_charts 메서드 호출)
+        self.timer = QTimer()
+        self.timer.timeout.connect(self.update_charts)
+        self.timer.start(10000)
 
-        tray_menu = QMenu()
-        restore_action = QAction("복원", self)
-        restore_action.triggered.connect(self.show_window)
-        tray_menu.addAction(restore_action)
+        # 레이아웃 구성
+        self.layout = QVBoxLayout()  # 메인 레이아웃 생성
+        button_layout = QHBoxLayout()  # 버튼 레이아웃 생성
+        button_layout.addWidget(self.exit_button)  # 종료 버튼을 버튼 레이아웃에 추가
+        self.layout.addLayout(button_layout)  # 버튼 레이아웃을 메인 레이아웃에 추가
 
-        quit_action = QAction("종료", self)
-        quit_action.triggered.connect(self.quit_app)
-        tray_menu.addAction(quit_action)
+        # 차트 레이아웃 생성
+        chart_layout = QHBoxLayout()
+        container = QWidget()  # 레이아웃을 감싸는 컨테이너 위젯 생성
+        container.setLayout(self.layout)
+        self.setCentralWidget(container)  # 컨테이너를 중앙 위젯으로 설정
 
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self.on_tray_icon_activated)
+        # 좌측 차트 뷰 생성 및 레이아웃에 추가
+        self.left_web_view = QWebEngineView()
+        chart_layout.addWidget(self.left_web_view)
 
-        self.text_edit = QTextEdit(self)
-        self.text_edit.setReadOnly(True)
+        # 우측 차트 뷰 생성 및 레이아웃에 추가
+        self.right_web_view = QWebEngineView()
+        chart_layout.addWidget(self.right_web_view)
 
-        # 오전 및 오후 시작/종료 시간 입력 필드 추가
-        self.am_start_label = QLabel("오전 시작 시간:")
-        self.am_start_hour_input = QLineEdit(self)
-        self.am_start_hour_input.setFixedWidth(30)
-        self.am_start_hour_input.setPlaceholderText("시")
+        # 차트 레이아웃을 메인 레이아웃에 추가
+        self.layout.addLayout(chart_layout)
 
-        self.am_start_minute_input = QLineEdit(self)
-        self.am_start_minute_input.setFixedWidth(30)
-        self.am_start_minute_input.setPlaceholderText("분")
+        # 초기 차트 로드
+        self.load_initial_charts()
 
-        self.am_start_hour_input.setText("06")
-        self.am_start_minute_input.setText("00")
+    def close_application(self):
+        """애플리케이션을 종료하는 메서드"""
+        self.close()
 
-        self.am_end_label = QLabel("오전 종료 시간:")
-        self.am_end_hour_input = QLineEdit(self)
-        self.am_end_hour_input.setFixedWidth(30)
-        self.am_end_hour_input.setPlaceholderText("시")
+    def load_initial_charts(self):
+        """초기 차트를 로드하는 메서드"""
+        # 좌측 차트 데이터 가져오기 및 생성
+        bar_df = self.fetch_bar_chart_data()
+        left_fig_json = self.create_left_figure(bar_df)
 
-        self.am_end_minute_input = QLineEdit(self)
-        self.am_end_minute_input.setFixedWidth(30)
-        self.am_end_minute_input.setPlaceholderText("분")
-        self.am_end_hour_input.setText("10")
-        self.am_end_minute_input.setText("00")
+        # 우측 차트 데이터 가져오기 및 생성
+        line_df = self.fetch_line_chart_data()
+        right_fig_json = self.create_right_figure(line_df)
 
-        self.pm_start_label = QLabel("오후 시작 시간:")
-        self.pm_start_hour_input = QLineEdit(self)
-        self.pm_start_hour_input.setFixedWidth(30)
-        self.pm_start_hour_input.setPlaceholderText("시")
+        # 좌측 차트 로드
+        self.left_web_view.setHtml(self.generate_html(left_fig_json))
 
-        self.pm_start_minute_input = QLineEdit(self)
-        self.pm_start_minute_input.setFixedWidth(30)
-        self.pm_start_minute_input.setPlaceholderText("분")
+        # 우측 차트 로드
+        self.right_web_view.setHtml(self.generate_html(right_fig_json))
 
-        self.pm_start_hour_input.setText("15")
-        self.pm_start_minute_input.setText("00")
+    def fetch_bar_chart_data(self):
+        """좌측 차트 데이터를 MSSQL에서 가져오는 메서드"""
+        bar_query = """
+            SELECT YMD, AM_PM, SUM(milk_weight) as milk_weight
+            FROM ICT_MILKING_LOG WITH(NOLOCK)
+            WHERE YMD BETWEEN CONVERT(char(8), DATEADD(DAY, -7, GETDATE()), 112) AND CONVERT(char(8), GETDATE(), 112)
+            GROUP BY YMD, AM_PM
+            ORDER BY YMD, AM_PM
+        """
+        bar_df = pd.read_sql(bar_query, mssql_engine)  # 쿼리 결과를 Pandas DataFrame으로 변환
+        bar_df['YMD'] = pd.to_datetime(bar_df['YMD'], format='%Y%m%d')  # 날짜 형식으로 변환
+        bar_df = bar_df.sort_values(by=['YMD', 'AM_PM'])  # 정렬
+        return bar_df
 
-        self.pm_end_label = QLabel("오후 종료 시간:")
-        self.pm_end_hour_input = QLineEdit(self)
-        self.pm_end_hour_input.setFixedWidth(30)
-        self.pm_end_hour_input.setPlaceholderText("시")
+    def fetch_line_chart_data(self):
+        """우측 차트 데이터를 MSSQL에서 가져오는 메서드"""
+        line_query = """
+            SELECT YMD, COUNT(DISTINCT COW_NO) as CNT, SUM(milk_weight) as milk_weight
+            FROM ICT_MILKING_LOG WITH(NOLOCK)
+            WHERE YMD BETWEEN CONVERT(char(8), DATEADD(DAY, -7, GETDATE()), 112) AND CONVERT(char(8), GETDATE(), 112)
+            GROUP BY YMD
+            ORDER BY YMD
+        """
+        line_df = pd.read_sql(line_query, mssql_engine)  # 쿼리 결과를 Pandas DataFrame으로 변환
+        line_df['YMD'] = pd.to_datetime(line_df['YMD'], format='%Y%m%d')  # 날짜 형식으로 변환
+        return line_df
 
-        self.pm_end_minute_input = QLineEdit(self)
-        self.pm_end_minute_input.setFixedWidth(30)
-        self.pm_end_minute_input.setPlaceholderText("분")
+    def create_left_figure(self, bar_df):
+        """좌측 차트 생성 메서드"""
+        fig = go.Figure()
+        for am_pm, color in [('1', '#ffebcd'), ('2', '#33b27d')]:  # 오전/오후에 따라 색상 다르게 설정
+            filtered_df = bar_df[bar_df['AM_PM'] == am_pm]
+            fig.add_trace(
+                go.Bar(
+                    x=filtered_df['YMD'],
+                    y=filtered_df['milk_weight'],
+                    name='오전' if am_pm == '1' else '오후',
+                    marker_color=color,
+                    text=[f"오전: {x:,.2f}" if am_pm == '1' else f"오후: {x:,.2f}" for x in filtered_df['milk_weight']],
+                    textposition='inside',
+                    hovertemplate="%{x} - %{text}<extra></extra>",
+                    textfont=dict(size=15)
+                )
+            )
 
-        self.pm_end_hour_input.setText("19")
-        self.pm_end_minute_input.setText("00")
+        # 각 날짜에 총 착유량 표시
+        for date in bar_df['YMD'].unique():
+            total_milk_weight = bar_df[bar_df['YMD'] == date]['milk_weight'].sum()
+            fig.add_annotation(
+                x=date,
+                y=total_milk_weight,
+                text=f"Total: {total_milk_weight:,.2f}",
+                showarrow=False,
+                font=dict(size=15, color="white"),
+                xanchor='center',
+                yanchor='bottom'
+            )
 
-        # 한 줄에 배치하기 위해 QHBoxLayout 사용
-        time_layout = QHBoxLayout()
-        time_layout.addWidget(self.am_start_label)
-        time_layout.addWidget(self.am_start_hour_input)
-        time_layout.addWidget(self.am_start_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(self.am_end_label)
-        time_layout.addWidget(self.am_end_hour_input)
-        time_layout.addWidget(self.am_end_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(self.pm_start_label)
-        time_layout.addWidget(self.pm_start_hour_input)
-        time_layout.addWidget(self.pm_start_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(self.pm_end_label)
-        time_layout.addWidget(self.pm_end_hour_input)
-        time_layout.addWidget(self.pm_end_minute_input)
+        # 차트 레이아웃 설정
+        fig.update_layout(
+            title=dict(text="일별 오전/오후 착유량", font=dict(color="white")),
+            xaxis=dict(tickformat="%Y.%m.%d", color="white"),
+            yaxis=dict(color="white"),
+            legend=dict(orientation="h", yanchor="bottom", y=1.1, xanchor="center", x=0.5, font=dict(color="white")),
+            font=dict(size=15),
+            plot_bgcolor="#3C3F41",
+            paper_bgcolor="#3C3F41",
+            barmode='stack'
+        )
+        return fig.to_json()
 
-        self.interval_label = QLabel("수집주기 (초):", self)
-        self.interval_input = QLineEdit(self)
-        self.interval_input.setFixedWidth(50)
-        self.interval_input.setText("120")
+    def create_right_figure(self, line_df):
+        """우측 차트 생성 메서드"""
+        fig = go.Figure()
 
-        self.start_button = QPushButton("데이터 수집 시작", self)
-        self.start_button.setFixedWidth(300)
-        self.start_button.setStyleSheet("color: green;")
-        self.start_button.clicked.connect(self.start_data_collection)
+        # 두수(CNT)를 막대 그래프로 추가
+        fig.add_trace(go.Bar(
+            x=line_df['YMD'],
+            y=line_df['CNT'],
+            name='두수',
+            marker_color='#486297',
+            text=[f"{x:,}" for x in line_df['CNT']],
+            textposition='inside',
+            textfont=dict(color="white"),
+            yaxis='y1'
+        ))
 
-        self.stop_button = QPushButton("데이터 수집 정지", self)
-        self.stop_button.setFixedWidth(300)
-        self.stop_button.setStyleSheet("color: red;")
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self.stop_data_collection)
+        # 착유량(milk_weight)을 꺾은선 그래프로 추가
+        fig.add_trace(go.Scatter(
+            x=line_df['YMD'],
+            y=line_df['milk_weight'],
+            name='착유량',
+            mode='lines+markers',
+            marker_color='#e59c24',
+            text=[f"{x:,.2f}" for x in line_df['milk_weight']],
+            textposition='top center',
+            textfont=dict(color="black"),
+            yaxis='y2'
+        ))
 
-        # Progress bar 추가
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setValue(0)  # 초기값 0 설정
-        self.progress_bar.setAlignment(Qt.AlignCenter)
-        self.progress_bar.setFixedHeight(30)  # 프로그레스바 높이 설정
+        # 차트 레이아웃 설정
+        fig.update_layout(
+            title=dict(text="일별 두수 및 착유량", font=dict(color="white")),
+            xaxis=dict(
+                tickformat="%Y.%m.%d",
+                color="white"
+            ),
+            yaxis=dict(
+                title="",
+                color="lightblue",
+                dtick=100
+            ),
+            yaxis2=dict(
+                title="",
+                overlaying='y',
+                side='right',
+                color="orange",
+                showgrid=False,
+                dtick=500
+            ),
+            legend=dict(
+                orientation="h",
+                yanchor="bottom", y=1.1,
+                xanchor="center", x=0.5,
+                font=dict(color="white")
+            ),
+            font=dict(size=15),
+            plot_bgcolor="#3C3F41",
+            paper_bgcolor="#3C3F41"
+        )
+        return fig.to_json()
 
-        controls_layout = QHBoxLayout()
-        controls_layout.addWidget(self.interval_label)
-        controls_layout.addWidget(self.interval_input)
-        controls_layout.addWidget(self.start_button)
-        controls_layout.addWidget(self.stop_button)
+    def generate_html(self, fig_json):
+        """Plotly 차트를 표시하기 위한 HTML 생성 메서드"""
+        return f"""
+        <html>
+        <head>
+            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
+        </head>
+        <body>
+            <div id="chart" style="width:100%; height:100%;"></div>
+            <script>
+                var fig_data = {fig_json};
+                Plotly.newPlot("chart", fig_data.data, fig_data.layout, {{responsive: true}});
+            </script>
+        </body>
+        </html>
+        """
 
-        # 문구를 위한 QLabel 추가
-        self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.", self)
-        self.info_label.setStyleSheet("color: red;")
-        self.info_label.setFixedHeight(30)
-        self.info_label.setContentsMargins(0, 0, 10, 10)
+    def update_charts(self):
+        """차트를 10초마다 업데이트하는 메서드"""
+        # 업데이트된 데이터를 가져와 좌측 차트 업데이트
+        new_bar_df = self.fetch_bar_chart_data()
+        new_left_fig_json = self.create_left_figure(new_bar_df)
+        self.left_web_view.setHtml(self.generate_html(new_left_fig_json))
 
-        # 기존 레이아웃에 추가
-        layout = QVBoxLayout()
-        layout.addWidget(self.info_label)
-        layout.addLayout(time_layout)
-        layout.addWidget(self.text_edit)
-        layout.addWidget(self.progress_bar)  # Progress bar 추가
-        layout.addLayout(controls_layout)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
-        self.worker = None
-
-        # 타이머 설정
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.check_time_for_auto_start_stop)
-        self.timer.start(60000)
-
-        self.check_time_for_auto_start_stop()
-
-    def check_time_for_auto_start_stop(self):
-        current_time = QTime.currentTime()
-        am_start_hour = int(self.am_start_hour_input.text())
-        am_start_minute = int(self.am_start_minute_input.text())
-        am_end_hour = int(self.am_end_hour_input.text())
-        am_end_minute = int(self.am_end_minute_input.text())
-        pm_start_hour = int(self.pm_start_hour_input.text())
-        pm_start_minute = int(self.pm_start_minute_input.text())
-        pm_end_hour = int(self.pm_end_hour_input.text())
-        pm_end_minute = int(self.pm_end_minute_input.text())
-
-        if (current_time.hour() > am_start_hour or (
-                current_time.hour() == am_start_hour and current_time.minute() >= am_start_minute)) and \
-                (current_time.hour() < am_end_hour or (
-                        current_time.hour() == am_end_hour and current_time.minute() < am_end_minute)):
-            if not self.worker or not self.worker.isRunning():
-                self.start_data_collection()
-
-        elif (current_time.hour() > pm_start_hour or (
-                current_time.hour() == pm_start_hour and current_time.minute() >= pm_start_minute)) and \
-                (current_time.hour() < pm_end_hour or (
-                        current_time.hour() == pm_end_hour and current_time.minute() < pm_end_minute)):
-            if not self.worker or not self.worker.isRunning():
-                self.start_data_collection()
-
-        elif current_time.hour() > am_end_hour or (
-                current_time.hour() == am_end_hour and current_time.minute() >= am_end_minute):
-            if self.worker and self.worker.isRunning():
-                self.stop_data_collection()
-
-        elif current_time.hour() > pm_end_hour or (
-                current_time.hour() == pm_end_hour and current_time.minute() >= pm_end_minute):
-            if self.worker and self.worker.isRunning():
-                self.stop_data_collection()
-
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        self.tray_icon.show()
-
-    def on_tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.show_window()
-
-    def show_window(self):
-        self.show()
-        self.tray_icon.hide()
-
-    def quit_app(self):
-        QApplication.quit()
-
-    def start_data_collection(self):
-        try:
-            interval = int(self.interval_input.text())
-            if interval < 10:
-                raise ValueError
-        except ValueError:
-            self.append_text("수집 주기는 10초 이상의 양수로 입력해주세요.\n")
-            return
-
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-
-        self.worker = DataWorker(interval)
-        self.worker.update_text.connect(self.append_text)
-        self.worker.update_progress.connect(self.update_progress)  # Progress bar 업데이트 연결
-        self.worker.finished.connect(self.on_data_collection_finished)
-        self.worker.start()
-
-    def stop_data_collection(self):
-        if self.worker:
-            self.worker.stop()
-
-    def on_data_collection_finished(self):
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.append_text("-> 데이터 수집이 정지되었습니다.\n")
-
-    def append_text(self, text):
-        self.text_edit.append(text)
-        self.text_edit.ensureCursorVisible()
-        max_lines = 500
-        if self.text_edit.document().blockCount() > max_lines:
-            cursor = self.text_edit.textCursor()
-            cursor.movePosition(cursor.Start)
-            cursor.select(cursor.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
-
-    # Progress bar 업데이트
-    def update_progress(self, value):
-        self.progress_bar.setValue(value)
+        # 업데이트된 데이터를 가져와 우측 차트 업데이트
+        new_line_df = self.fetch_line_chart_data()
+        new_right_fig_json = self.create_right_figure(new_line_df)
+        self.right_web_view.setHtml(self.generate_html(new_right_fig_json))
 
 if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    icon_path = resource_path("activity.png")
-    app.setWindowIcon(QIcon(icon_path))
-    window = MainWindow()
-    window.show()
-    sys.exit(app.exec_())
+    app = QApplication(sys.argv)  # PyQt5 애플리케이션 객체 생성
+    main_app = MilkWeightApp()  # MilkWeightApp 인스턴스 생성
+    main_app.showFullScreen()  # 전체 화면으로 애플리케이션 표시
+    sys.exit(app.exec_())  # 애플리케이션 이벤트 루프 시작

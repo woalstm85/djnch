@@ -50,7 +50,7 @@ def update_bar_chart(n):
     # 30개씩 데이터를 슬라이싱
     start_index = (n * 30) % len(df)
     end_index = start_index + 30
-    sliced_df = df.iloc[start_index:end_index]
+    sliced_df = df.iloc[start_index:end_index].copy()
 
     # YMD 컬럼을 날짜 형식으로 변환
     sliced_df['YMD'] = pd.to_datetime(sliced_df['YMD'], format='%Y%m%d').dt.strftime('%Y.%m.%d')
