@@ -1,8 +1,8 @@
 import sys  # 시스템 관련 기능을 사용하기 위한 모듈
 import pandas as pd  # 데이터 분석 및 조작을 위한 라이브러리
 import plotly.graph_objects as go  # Plotly를 사용하여 대화형 차트를 생성하기 위한 모듈
-from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QHBoxLayout, QPushButton  # PyQt5의 GUI 구성 요소
-from PyQt5.QtCore import QTimer  # PyQt5에서 타이머 기능을 사용하기 위한 모듈
+from PyQt5.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget, QHBoxLayout, QPushButton, QLabel  # PyQt5의 GUI 구성 요소
+from PyQt5.QtCore import QTimer, Qt  # PyQt5에서 타이머 및 정렬 기능을 사용하기 위한 모듈
 from PyQt5.QtWebEngineWidgets import QWebEngineView  # PyQt5에서 웹 콘텐츠를 표시하기 위한 모듈
 from sqlalchemy import create_engine  # 데이터베이스 연결을 설정하기 위한 SQLAlchemy의 모듈
 
@@ -28,7 +28,8 @@ class MilkWeightApp(QMainWindow):  # PyQt5의 QMainWindow 클래스를 상속받
                 background-color: #FFCCCC;
             }
         """)
-        self.exit_button.clicked.connect(self.close_application)  # 버튼 클릭 시 애플리케이션 종료
+        # 버튼 클릭 시 애플리케이션 종료
+        self.exit_button.clicked.connect(self.close_application)
 
         # 차트 자동 업데이트를 위한 타이머 설정 (10초마다 update_charts 메서드 호출)
         self.timer = QTimer()
@@ -40,6 +41,12 @@ class MilkWeightApp(QMainWindow):  # PyQt5의 QMainWindow 클래스를 상속받
         button_layout = QHBoxLayout()  # 버튼 레이아웃 생성
         button_layout.addWidget(self.exit_button)  # 종료 버튼을 버튼 레이아웃에 추가
         self.layout.addLayout(button_layout)  # 버튼 레이아웃을 메인 레이아웃에 추가
+
+        # 오류 메시지를 표시할 QLabel 생성
+        self.error_label = QLabel("데이터를 로드할 수 없습니다. 연결을 확인해 주세요.")
+        self.error_label.setStyleSheet("color: red; font-size: 20px;")
+        self.error_label.setAlignment(Qt.AlignCenter)
+        self.error_label.hide()  # 초기에는 숨김
 
         # 차트 레이아웃 생성
         chart_layout = QHBoxLayout()
@@ -56,6 +63,7 @@ class MilkWeightApp(QMainWindow):  # PyQt5의 QMainWindow 클래스를 상속받
         chart_layout.addWidget(self.right_web_view)
 
         # 차트 레이아웃을 메인 레이아웃에 추가
+        self.layout.addWidget(self.error_label)  # 오류 메시지 추가
         self.layout.addLayout(chart_layout)
 
         # 초기 차트 로드
@@ -67,49 +75,65 @@ class MilkWeightApp(QMainWindow):  # PyQt5의 QMainWindow 클래스를 상속받
 
     def load_initial_charts(self):
         """초기 차트를 로드하는 메서드"""
-        # 좌측 차트 데이터 가져오기 및 생성
         bar_df = self.fetch_bar_chart_data()
-        left_fig_json = self.create_left_figure(bar_df)
-
-        # 우측 차트 데이터 가져오기 및 생성
         line_df = self.fetch_line_chart_data()
-        right_fig_json = self.create_right_figure(line_df)
 
-        # 좌측 차트 로드
-        self.left_web_view.setHtml(self.generate_html(left_fig_json))
+        if bar_df.empty or line_df.empty:
+            self.display_error_message()
+        else:
+            self.error_label.hide()
+            self.left_web_view.show()
+            self.right_web_view.show()
+            left_fig_json = self.create_left_figure(bar_df)
+            right_fig_json = self.create_right_figure(line_df)
+            self.left_web_view.setHtml(self.generate_html(left_fig_json))
+            self.right_web_view.setHtml(self.generate_html(right_fig_json))
 
-        # 우측 차트 로드
-        self.right_web_view.setHtml(self.generate_html(right_fig_json))
+    def display_error_message(self):
+        """에러 메시지를 표시하는 메서드"""
+        self.error_label.show()
+        self.left_web_view.hide()
+        self.right_web_view.hide()
 
     def fetch_bar_chart_data(self):
         """좌측 차트 데이터를 MSSQL에서 가져오는 메서드"""
-        bar_query = """
-            SELECT YMD, AM_PM, SUM(milk_weight) as milk_weight
-            FROM ICT_MILKING_LOG WITH(NOLOCK)
-            WHERE YMD BETWEEN CONVERT(char(8), DATEADD(DAY, -7, GETDATE()), 112) AND CONVERT(char(8), GETDATE(), 112)
-            GROUP BY YMD, AM_PM
-            ORDER BY YMD, AM_PM
-        """
-        bar_df = pd.read_sql(bar_query, mssql_engine)  # 쿼리 결과를 Pandas DataFrame으로 변환
-        bar_df['YMD'] = pd.to_datetime(bar_df['YMD'], format='%Y%m%d')  # 날짜 형식으로 변환
-        bar_df = bar_df.sort_values(by=['YMD', 'AM_PM'])  # 정렬
-        return bar_df
+        try:
+            bar_query = """
+                SELECT YMD, AM_PM, SUM(milk_weight) as milk_weight
+                FROM ICT_MILKING_LOG WITH(NOLOCK)
+                WHERE YMD BETWEEN CONVERT(char(8), DATEADD(DAY, -7, GETDATE()), 112) AND CONVERT(char(8), GETDATE(), 112)
+                GROUP BY YMD, AM_PM
+                ORDER BY YMD, AM_PM
+            """
+            bar_df = pd.read_sql(bar_query, mssql_engine)
+            bar_df['YMD'] = pd.to_datetime(bar_df['YMD'], format='%Y%m%d')
+            return bar_df.sort_values(by=['YMD', 'AM_PM'])
+        except Exception as e:
+            print(f"Error fetching bar chart data: {e}")
+            return pd.DataFrame()
 
     def fetch_line_chart_data(self):
         """우측 차트 데이터를 MSSQL에서 가져오는 메서드"""
-        line_query = """
-            SELECT YMD, COUNT(DISTINCT COW_NO) as CNT, SUM(milk_weight) as milk_weight
-            FROM ICT_MILKING_LOG WITH(NOLOCK)
-            WHERE YMD BETWEEN CONVERT(char(8), DATEADD(DAY, -7, GETDATE()), 112) AND CONVERT(char(8), GETDATE(), 112)
-            GROUP BY YMD
-            ORDER BY YMD
-        """
-        line_df = pd.read_sql(line_query, mssql_engine)  # 쿼리 결과를 Pandas DataFrame으로 변환
-        line_df['YMD'] = pd.to_datetime(line_df['YMD'], format='%Y%m%d')  # 날짜 형식으로 변환
-        return line_df
+        try:
+            line_query = """
+                SELECT YMD, COUNT(DISTINCT COW_NO) as CNT, SUM(milk_weight) as milk_weight
+                FROM ICT_MILKING_LOG WITH(NOLOCK)
+                WHERE YMD BETWEEN CONVERT(char(8), DATEADD(DAY, -7, GETDATE()), 112) AND CONVERT(char(8), GETDATE(), 112)
+                GROUP BY YMD
+                ORDER BY YMD
+            """
+            line_df = pd.read_sql(line_query, mssql_engine)
+            line_df['YMD'] = pd.to_datetime(line_df['YMD'], format='%Y%m%d')
+            return line_df
+        except Exception as e:
+            print(f"Error fetching line chart data: {e}")
+            return pd.DataFrame()
 
     def create_left_figure(self, bar_df):
         """좌측 차트 생성 메서드"""
+        if bar_df.empty:
+            return go.Figure().to_json()  # 빈 차트를 반환
+
         fig = go.Figure()
         for am_pm, color in [('1', '#ffebcd'), ('2', '#33b27d')]:  # 오전/오후에 따라 색상 다르게 설정
             filtered_df = bar_df[bar_df['AM_PM'] == am_pm]
@@ -154,6 +178,9 @@ class MilkWeightApp(QMainWindow):  # PyQt5의 QMainWindow 클래스를 상속받
 
     def create_right_figure(self, line_df):
         """우측 차트 생성 메서드"""
+        if line_df.empty:
+            return go.Figure().to_json()  # 빈 차트를 반환
+
         fig = go.Figure()
 
         # 두수(CNT)를 막대 그래프로 추가
@@ -232,15 +259,19 @@ class MilkWeightApp(QMainWindow):  # PyQt5의 QMainWindow 클래스를 상속받
 
     def update_charts(self):
         """차트를 10초마다 업데이트하는 메서드"""
-        # 업데이트된 데이터를 가져와 좌측 차트 업데이트
         new_bar_df = self.fetch_bar_chart_data()
-        new_left_fig_json = self.create_left_figure(new_bar_df)
-        self.left_web_view.setHtml(self.generate_html(new_left_fig_json))
-
-        # 업데이트된 데이터를 가져와 우측 차트 업데이트
         new_line_df = self.fetch_line_chart_data()
-        new_right_fig_json = self.create_right_figure(new_line_df)
-        self.right_web_view.setHtml(self.generate_html(new_right_fig_json))
+
+        if new_bar_df.empty or new_line_df.empty:
+            self.display_error_message()
+        else:
+            self.error_label.hide()
+            new_left_fig_json = self.create_left_figure(new_bar_df)
+            new_right_fig_json = self.create_right_figure(new_line_df)
+            self.left_web_view.setHtml(self.generate_html(new_left_fig_json))
+            self.right_web_view.setHtml(self.generate_html(new_right_fig_json))
+            self.left_web_view.show()
+            self.right_web_view.show()
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)  # PyQt5 애플리케이션 객체 생성
