@@ -1,874 +1,450 @@
 import sys
 import os
 import pandas as pd
-from PyQt5.QtWidgets import QApplication, QTableWidget, QTableWidgetItem, QMainWindow, QVBoxLayout, QWidget, QLabel, \
-    QHBoxLayout
-from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QBrush, QFont
-from PyQt5.QtWebEngineWidgets import QWebEngineView
-from PyQt5.QtWidgets import QHeaderView
+import logging
+from logging.handlers import TimedRotatingFileHandler
+import time
+from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, \
+    QLabel, QLineEdit, QSystemTrayIcon, QMenu, QAction
+from PyQt5.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker, Qt
+from PyQt5.QtGui import QIcon
 from sqlalchemy import create_engine, text
-import plotly.graph_objects as go
-# 현재 스크립트의 디렉토리를 기준으로 경로 설정
-base_path = os.path.dirname(os.path.abspath(__file__))
-# QtWebEngineProcess.exe 경로 설정
-qt_process_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '_internal', 'PyQt5', 'Qt5', 'bin', 'QtWebEngineProcess.exe')
+from sqlalchemy.exc import SQLAlchemyError, OperationalError, TimeoutError
+from datetime import datetime
+from PyQt5.QtCore import QTime
 
-# MSSQL 데이터베이스 연결 설정
+
+# 리소스 파일에 접근할 수 있도록 경로 설정 함수
+def resource_path(relative_path):
+    try:
+        base_path = sys._MEIPASS
+    except Exception:
+        base_path = os.path.abspath(".")
+    return os.path.join(base_path, relative_path)
+
+# 로그 파일 이름 고정
+log_file_name = "data_milking.log"
+log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
+log_handler.setFormatter(log_formatter)
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+logger.addHandler(log_handler)
+
+# PostgreSQL 및 MSSQL 연결 설정
+#pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
+pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
 mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
+pg_engine = create_engine(pg_connection_string)
 mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
 
-# SP 호출
-def fetch_data(param1, param2):
-    with mssql_engine.connect() as connection:
-        result = connection.execute(text("EXEC P_DASHBOARD_V1 :param1, :param2"), {'param1': param1, 'param2': param2})
-        df = pd.DataFrame(result.fetchall(), columns=result.keys())
-        if param1 == 'V2':
-            df['YMD'] = pd.to_datetime(df['YMD'], format='%Y%m%d')
-    return df
+class DataWorker(QThread):
+    update_text = pyqtSignal(str)
+    finished = pyqtSignal()
+
+    def __init__(self, interval):
+        super().__init__()
+        self.interval = interval
+        self.stop_requested = False
+        self.mutex = QMutex()
+
+    def run(self):
+        max_retries = 3  # 최대 재시도 횟수
+        retry_delay = 5  # 재시도 대기 시간 (초)
+
+        while not self.stop_requested:
+            start_time = time.time()
+            retries = 0  # 현재 재시도 횟수 초기화
+
+            while retries <= max_retries and not self.stop_requested:
+                try:
+                    start_time_display = datetime.now().strftime('%Y.%m.%d %H:%M:%S')
+                    self.update_text.emit(f"***********************************************\n")
+                    self.update_text.emit(f"-> 데이터 수집 시작 시간 : {start_time_display}\n")
+                    logger.info(f"데이터 수집 시작 시간 : {start_time_display}")
+
+                    # MSSQL에서 최대 milking_id 값 조회
+                    with mssql_engine.connect() as mssql_conn:
+                        max_tstamp = mssql_conn.execute(
+                            text("SELECT ISNULL(MAX(tstamp), CAST('1900-01-01 00:00:00.000000' AS DATETIME2(6)))  FROM ICT_MILKING_ORG_LOG WITH(NOLOCK)")
+                        ).scalar()
+
+                    # PostgreSQL에서 데이터 가져오기
+                    with pg_engine.connect() as pg_conn:
+                        query = text("""
+                                    SELECT 
+                                        a.milking_id,
+                                        to_char(a.tstamp, 'YYYYMMDD') AS YMD,
+                                        CASE 
+                                            WHEN to_char(a.tstamp, 'HH24MISS') < '120000' THEN '1' 
+                                            ELSE '2' 
+                                        END AS AM_PM,
+                                        to_char(a.tstamp, 'HH24MISS') AS HMS,
+                                        a.cow_id,
+                                        b.cow_number,
+                                        b.cow_name,
+                                        a.milkingshift_id,
+                                        detacher_address,
+                                        id_tag_number_assigned,
+                                        round(CAST(float8 (milk_weight * 0.45359) as numeric), 1) AS milk_weight,
+                                        round(CAST(float8 (dumped_milk * 0.45359) as numeric), 1) AS dumped_milk,
+                                        milk_conductivity,
+                                        cow_activity,
+                                        convertunits(c.flow_0_15_sec) AS flow_0_15_sec,
+                                        convertunits(c.flow_15_30_sec) AS flow_15_30_sec,
+                                        convertunits(c.flow_30_60_sec) AS flow_30_60_sec,
+                                        convertunits(c.flow_60_120_sec) AS flow_60_120_sec,
+                                        c.time_in_low_flow,
+                                        c.reattach_counter,
+                                        c.percent_expected_milk,
+                                        to_char(a.tstamp, 'YYYY-MM-DD HH24:MI:SS.US') AS tstamp_string
+                                    FROM tblmilkings AS a
+                                    LEFT OUTER JOIN public.vewcows AS b 
+                                        ON a.cow_id = b.cow_id
+                                    LEFT OUTER JOIN public.tblstallperformances AS c 
+                                        ON a.milking_id = c.milking_id
+                                    WHERE id_tag_number_assigned <> ''
+                                      AND a.tstamp > :max_tstamp
+                                    ORDER BY a.milkingshift_id, a.tstamp
+                        """)
+                        result = pg_conn.execute(query, {"max_tstamp": max_tstamp})
+                        data = result.fetchall()
+
+                    pg_row_count = len(data)
+                    pg_duration = time.time() - start_time
+                    self.update_text.emit(f"-> PostgreSQL 데이터 건수: {pg_row_count}건 / {pg_duration:.2f}초\n")
+
+                    if pg_row_count == 0:
+                        self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
+                    else:
+                        # 데이터프레임으로 변환
+                        df = pd.DataFrame(data, columns=[
+                            "milking_id", "YMD", "AM_PM", "HMS", "cow_id", "cow_number", "cow_name", "milkingshift_id",
+                            "detacher_address", "id_tag_number_assigned", "milk_weight", "dumped_milk",
+                            "milk_conductivity", "cow_activity", "flow_0_15_sec", "flow_15_30_sec",
+                            "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
+                            "percent_expected_milk", "tstamp_string"
+                        ])
+
+                        records = df.to_dict(orient='records')
+                        with mssql_engine.connect() as conn:
+                            postgresql_complete_time = time.time() # PostgreSQL에서 데이터를 가져온 후, 완료 시점 시간 기록
+                            for i in range(0, len(records), 500):  # 500개씩 배치 처리
+                                batch = records[i:i + 500]
+                                for record in batch:  # 각 record를 저장 프로시저에 전달
+                                    conn.execute(text("""
+                                        EXEC P_ICT_MILKING_ORG_LOG_M 
+                                            @milking_id=:milking_id, @ymd=:YMD, @am_pm=:AM_PM, @hms=:HMS, @cow_id=:cow_id, 
+                                            @cow_number=:cow_number, @cow_name=:cow_name, @milkingshift_id=:milkingshift_id, 
+                                            @detacher_address=:detacher_address, @id_tag_number_assigned=:id_tag_number_assigned, 
+                                            @milk_weight=:milk_weight, @dumped_milk=:dumped_milk, @milk_conductivity=:milk_conductivity, 
+                                            @cow_activity=:cow_activity, @flow_0_15_sec=:flow_0_15_sec, @flow_15_30_sec=:flow_15_30_sec, 
+                                            @flow_30_60_sec=:flow_30_60_sec, @flow_60_120_sec=:flow_60_120_sec, 
+                                            @time_in_low_flow=:time_in_low_flow, @reattach_counter=:reattach_counter, 
+                                            @percent_expected_milk=:percent_expected_milk, @tstamp=:tstamp_string
+                                    """), record)
+                            conn.commit()  # 배치 처리 후 커밋
+
+                        mssql_duration = time.time() - postgresql_complete_time
+                        self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
+                        self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
+                        logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
+                    break  # 재시도 성공 시 루프 탈출
+
+                # 구체적인 예외 처리 추가
+                except OperationalError as e:
+                    retries += 1
+                    self.update_text.emit(f"-> OperationalError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
+                    logger.warning(f"OperationalError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
+                    time.sleep(retry_delay)
+
+                except TimeoutError as e:
+                    retries += 1
+                    self.update_text.emit(f"-> TimeoutError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
+                    logger.warning(f"TimeoutError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
+                    time.sleep(retry_delay)
+
+                except SQLAlchemyError as e:
+                    retries += 1
+                    self.update_text.emit(f"-> SQLAlchemyError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
+                    logger.warning(f"SQLAlchemyError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
+                    time.sleep(retry_delay)
+
+                finally:
+                    end_time = time.time()
+                    elapsed_time = end_time - start_time
+                    remaining_time = self.interval - elapsed_time
+                    if remaining_time > 0:
+                        for _ in range(int(remaining_time / 0.1)):
+                            if self.stop_requested:
+                                break
+                            time.sleep(0.1)
+
+        self.finished.emit()
+
+    def stop(self):
+        with QMutexLocker(self.mutex):
+            self.stop_requested = True
+        self.update_text.emit("-> 중지 요청이 접수되었습니다... 중지 중입니다...\n")
+        logger.info("중지 요청이 접수되었습니다.")
+
+from PyQt5.QtCore import QTimer
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Cattle Data Viewer")
-        self.resize(1200, 800)
+        self.setWindowTitle("보우메틱 착유량")
+        self.setGeometry(300, 300, 500, 500)
 
-        # 메인 레이아웃 설정
-        main_widget = QWidget()
-        main_layout = QVBoxLayout(main_widget)
+        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
 
-        # 좌우 레이아웃 생성 및 추가
-        table_layout = QHBoxLayout()
-        table_layout.addLayout(self.create_left_layout(), stretch=4)
-        table_layout.addLayout(self.create_right_layout(), stretch=4)
-        main_layout.addLayout(table_layout)
+        icon_path = resource_path("milking.png")
+        self.tray_icon = QSystemTrayIcon(self)
+        self.tray_icon.setIcon(QIcon(icon_path))
 
-        # 각 QTableWidget에 에러 메시지를 덮는 레이어 추가
-        self.v1_error_overlay = self.create_error_overlay(self.v1_table)
-        self.v3_error_overlay = self.create_error_overlay(self.v3_table)
-        self.v6_error_overlay = self.create_error_overlay(self.v6_table)
+        tray_menu = QMenu()
+        restore_action = QAction("복원", self)
+        restore_action.triggered.connect(self.show_window)
+        tray_menu.addAction(restore_action)
 
-        # 초기에는 에러 메시지 레이어를 숨깁니다
-        self.hide_error_overlay(self.v1_error_overlay)
-        self.hide_error_overlay(self.v3_error_overlay)
-        self.hide_error_overlay(self.v6_error_overlay)
+        quit_action = QAction("종료", self)
+        quit_action.triggered.connect(self.quit_app)
+        tray_menu.addAction(quit_action)
 
-        # 메인 위젯 설정
-        self.setCentralWidget(main_widget)
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self.on_tray_icon_activated)
 
-        # 각 데이터의 이전 상태를 저장할 변수 초기화
-        self.v1_data = None
-        self.v2_data = None
-        self.v3_data = None
-        self.v4_data = None
-        self.v5_data = None
-        self.v6_data = None
-        self.v7_data = None
+        self.text_edit = QTextEdit(self)
+        self.text_edit.setReadOnly(True)
 
-        # 자동 갱신 타이머 설정
+        # 오전 및 오후 시작/종료 시간 입력 필드 추가
+        self.am_start_label = QLabel("오전 시작 시간:")
+        self.am_start_hour_input = QLineEdit(self)
+        self.am_start_hour_input.setFixedWidth(30)
+        self.am_start_hour_input.setPlaceholderText("시")
+
+        self.am_start_minute_input = QLineEdit(self)
+        self.am_start_minute_input.setFixedWidth(30)
+        self.am_start_minute_input.setPlaceholderText("분")
+
+        # 오전 시작 시간 기본값 6:00
+        self.am_start_hour_input.setText("06")
+        self.am_start_minute_input.setText("00")
+
+        self.am_end_label = QLabel("오전 종료 시간:")
+        self.am_end_hour_input = QLineEdit(self)
+        self.am_end_hour_input.setFixedWidth(30)
+        self.am_end_hour_input.setPlaceholderText("시")
+
+        self.am_end_minute_input = QLineEdit(self)
+        self.am_end_minute_input.setFixedWidth(30)
+        self.am_end_minute_input.setPlaceholderText("분")
+
+        # 오전 종료 시간 기본값 10:00
+        self.am_end_hour_input.setText("10")
+        self.am_end_minute_input.setText("00")
+
+        self.pm_start_label = QLabel("오후 시작 시간:")
+        self.pm_start_hour_input = QLineEdit(self)
+        self.pm_start_hour_input.setFixedWidth(30)
+        self.pm_start_hour_input.setPlaceholderText("시")
+
+        self.pm_start_minute_input = QLineEdit(self)
+        self.pm_start_minute_input.setFixedWidth(30)
+        self.pm_start_minute_input.setPlaceholderText("분")
+
+        # 오후 시작 시간 기본값 15:00
+        self.pm_start_hour_input.setText("15")
+        self.pm_start_minute_input.setText("00")
+
+        self.pm_end_label = QLabel("오후 종료 시간:")
+        self.pm_end_hour_input = QLineEdit(self)
+        self.pm_end_hour_input.setFixedWidth(30)
+        self.pm_end_hour_input.setPlaceholderText("시")
+
+        self.pm_end_minute_input = QLineEdit(self)
+        self.pm_end_minute_input.setFixedWidth(30)
+        self.pm_end_minute_input.setPlaceholderText("분")
+
+        # 오후 종료 시간 기본값 19:00
+        self.pm_end_hour_input.setText("19")
+        self.pm_end_minute_input.setText("00")
+
+        # 한 줄에 배치하기 위해 QHBoxLayout 사용
+        time_layout = QHBoxLayout()
+        time_layout.addWidget(self.am_start_label)
+        time_layout.addWidget(self.am_start_hour_input)
+        time_layout.addWidget(self.am_start_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(self.am_end_label)
+        time_layout.addWidget(self.am_end_hour_input)
+        time_layout.addWidget(self.am_end_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(self.pm_start_label)
+        time_layout.addWidget(self.pm_start_hour_input)
+        time_layout.addWidget(self.pm_start_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(self.pm_end_label)
+        time_layout.addWidget(self.pm_end_hour_input)
+        time_layout.addWidget(self.pm_end_minute_input)
+
+        self.interval_label = QLabel("수집주기 (초):", self)
+        self.interval_input = QLineEdit(self)
+        self.interval_input.setFixedWidth(50)
+        self.interval_input.setText("120")
+
+        self.start_button = QPushButton("데이터 수집 시작", self)
+        self.start_button.setFixedWidth(300)
+        self.start_button.setStyleSheet("color: green;")
+        self.start_button.clicked.connect(self.start_data_collection)
+
+        self.stop_button = QPushButton("데이터 수집 정지", self)
+        self.stop_button.setFixedWidth(300)
+        self.stop_button.setStyleSheet("color: red;")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_data_collection)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(self.interval_label)
+        controls_layout.addWidget(self.interval_input)
+        controls_layout.addWidget(self.start_button)
+        controls_layout.addWidget(self.stop_button)
+
+        # 문구를 위한 QLabel 추가
+        self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.", self)
+        self.info_label.setStyleSheet("color: red;")  # 스타일을 추가해 강조
+        self.info_label.setFixedHeight(30)  # 라벨 높이 조절 (30픽셀로 고정)
+        self.info_label.setContentsMargins(0, 0, 10, 10)  # 여백 설정 (좌, 상, 우, 하)
+
+        # 기존 레이아웃에 추가
+        layout = QVBoxLayout()
+        layout.addWidget(self.info_label)  # 문구를 상단에 추가
+        layout.addLayout(time_layout)  # 시간을 입력하는 레이아웃을 그 다음에 추가
+        layout.addWidget(self.text_edit)
+        layout.addLayout(controls_layout)
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
+
+        self.worker = None
+
+        # 타이머 설정
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.update_tables_and_charts)
-        self.timer.start(30000)  # 30초마다 새로 고침
-        self.update_tables_and_charts()
-
-    def update_tables_and_charts(self):  # data load
-        # 각 데이터 로드를 fetch_data_with_error_handling으로 관리
-        self.v1_data_table(self.fetch_data_with_error_handling('V1', 'M2', self.v1_table))
-        self.v2_data_chart(self.fetch_data_with_error_handling('V2', 'M2', self.v2_chart_view))
-        self.v3_data_table(self.fetch_data_with_error_handling('V3', 'M2', self.v3_table))
-        self.v4_data_chart(self.fetch_data_with_error_handling('V4', 'M2', self.v4_chart_view))
-        self.v5_data_chart(self.fetch_data_with_error_handling('V5', 'M2', self.v5_chart_view))
-        self.v6_data_table(self.fetch_data_with_error_handling('V6', 'M2', self.v6_table))
-        self.v7_data_chart(self.fetch_data_with_error_handling('V7', 'M2', self.v7_chart_view))
-
-    def create_left_layout(self): # 왼쪽 레이아웃 생성 (우사별 사육두수, 차트 등)
-        left_layout = QVBoxLayout()
-        # v1 우사별 사육두수 타이틀
-        v1_title_layout = QHBoxLayout()
-        v1_left_title_label = QLabel("  우사별 사육두수")
-        v1_left_title_label.setFont(QFont("Arial", 12, QFont.Bold))
-        v1_left_title_label.setStyleSheet("color: #763500;")
-        # 높이와 너비 고정 (필요에 따라 조정 가능)
-        v1_left_title_label.setFixedHeight(20)  # 원하는 높이로 조정
-
-        v1_title_layout.addWidget(v1_left_title_label, alignment=Qt.AlignLeft)
-
-        left_layout.addLayout(v1_title_layout)
-
-        self.v1_table = QTableWidget(0, 14, self)
-        self.v1_table.setStyleSheet("background-color: #111111; color: white; gridline-color: #5C5C5C;")
-        self.v1_table.verticalHeader().setVisible(False)
-        self.v1_table.horizontalHeader().setVisible(False)
-        self.v1_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.v1_headers()
-        left_layout.addWidget(self.v1_table)
-
-        # V2 차트 일별 착유현황 추이
-        self.v2_chart_view = QWebEngineView()
-        left_layout.addWidget(self.v2_chart_view)
-
-        # V4 차트 우군별 비육일수별 산유량 분포
-        self.v4_chart_view = QWebEngineView()
-        left_layout.addWidget(self.v4_chart_view)
-
-        return left_layout
-
-    def create_right_layout(self):  # 오른쪽 레이아웃 생성 (사육현황, 차트 등)
-        right_layout = QVBoxLayout()
-
-        # v3 축주별 사육현황 타이틀
-        v3_right_title_label = QLabel("  축주별 사육현황")
-        v3_right_title_label.setFont(QFont("Arial", 12, QFont.Bold))
-        v3_right_title_label.setStyleSheet("color: #763500;")
-        # 높이와 너비 고정 (필요에 따라 조정 가능)
-        v3_right_title_label.setFixedHeight(20)
-
-        right_layout.addWidget(v3_right_title_label)
-
-        # v3 축주별 사육현황 테이블
-        self.v3_table = QTableWidget(0, 13, self)
-        self.v3_table.setStyleSheet("background-color: #111111; color: white; gridline-color: #5C5C5C;")
-        self.v3_table.verticalHeader().setVisible(False)
-        self.v3_table.horizontalHeader().setVisible(False)
-        self.v3_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.v3_header()
-        right_layout.addWidget(self.v3_table)
-
-        # v5 산차별 구성비 차트
-        self.v5_chart_view = QWebEngineView()
-        right_layout.addWidget(self.v5_chart_view)
-
-        # v6 두당 산유량 분포 표 라벨
-        v6_table_layout = QVBoxLayout()
-        v6_title_label = QLabel("두당 산유량 분포")
-        v6_title_label.setFont(QFont("Arial", 12, QFont.Bold))
-        v6_title_label.setStyleSheet("color: #763500;")
-        v6_table_layout.addWidget(v6_title_label, alignment=Qt.AlignLeft)
-
-        # v6 두당 산유량 분포 표 테이블
-        self.v6_table = QTableWidget(0, 8, self)
-        self.v6_table.setStyleSheet("background-color: #111111; color: white; gridline-color: #5C5C5C;")
-        self.v6_table.verticalHeader().setVisible(False)
-        self.v6_table.horizontalHeader().setVisible(False)
-        self.v6_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.v6_table_header()
-        v6_table_layout.addWidget(self.v6_table)
-        right_layout.addLayout(v6_table_layout)
-
-        # v7 두당 산유량 구성비 차트
-        self.v7_chart_view = QWebEngineView()
-        right_layout.addWidget(self.v7_chart_view)
-
-        return right_layout
-
-    """"""""""""""""""""""""""""""""" 
-    start-v1 : 우사별 사육 두수 (테이블)
-    """""""""""""""""""""""""""""""""
-    def v1_headers(self):   # v1 table header setting
-        self.v1_table.setRowCount(2)
-
-        # 그룹 헤더 및 하위 헤더 생성
-        self.v1_table.setSpan(0, 0, 2, 2)
-        header_item = QTableWidgetItem("구분")
-        header_item.setFont(QFont("Arial", weight=QFont.Bold))
-        header_item.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v1_table.setItem(0, 0, header_item)
-
-        self.v1_table.setSpan(0, 2, 2, 1)
-        header_item_sum = QTableWidgetItem("합계")
-        header_item_sum.setFont(QFont("Arial", weight=QFont.Bold))
-        header_item_sum.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v1_table.setItem(0, 2, header_item_sum)
-
-        # 각 동 헤더 생성
-        header_info = {
-            "1동": (3, 4),
-            "2동": (5, 6),
-            "3동": (7, 8),
-            "4동": (9, 10),
-            "5동": (11, 12)
-        }
-
-        for text, (start_column, end_column) in header_info.items():
-            self.v1_main_header(text, start_column, end_column)     # v1_main_header main header 설정
-
-        # 6동 헤더 (단일 열)
-        self.v1_table.setSpan(0, 13, 2, 1)
-        header_item_6dong = QTableWidgetItem("6동")
-        header_item_6dong.setFont(QFont("Arial", weight=QFont.Bold))
-        header_item_6dong.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v1_table.setItem(0, 13, header_item_6dong)
-
-        # v1 sub title 설정
-        sub_headers = [
-            (2, "합계"),
-            (3, "1A"), (4, "1B"),
-            (5, "2A"), (6, "2B"),
-            (7, "3A"), (8, "3B"),
-            (9, "4A"), (10, "4B"),
-            (11, "5A"), (12, "5B")
-        ]
-
-        for column, text in sub_headers:
-            self.v1_sub_header(column, text)
-
-    def v1_main_header(self, text, start_column, end_column):   # v1 table main header
-        self.v1_table.setSpan(0, start_column, 1, end_column - start_column + 1)
-        header_item = QTableWidgetItem(text)
-        header_item.setFont(QFont("Arial", weight=QFont.Bold))
-        header_item.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v1_table.setItem(0, start_column, header_item)
-
-    def v1_sub_header(self, column, text):  # v1 table sub header
-        sub_header_item = QTableWidgetItem(text)
-        sub_header_item.setFont(QFont("Arial", 9, QFont.Bold))
-        sub_header_item.setBackground(QBrush(QColor("#5C5C5C")))
-        self.v1_table.setItem(1, column, sub_header_item)
-
-    def v1_data_table(self, data):    # v1 table data setting
-        df = data
-        # 새 데이터가 이전 데이터와 같으면 업데이트 중단
-        if df is None or df.equals(self.v1_data):
-            return
-
-        # 데이터가 변경된 경우에만 테이블 업데이트 수행
-        self.v1_data = df  # 새로운 데이터를 이전 데이터로 저장
-
-        start_row = 2
-        self.v1_table.setRowCount(start_row + len(df))
-
-        prev_row_index = None
-        for idx, row in df.iterrows():
-            row_index = start_row + idx
-            if row['GROW_NM'] == "착유우":
-                if prev_row_index is None:
-                    prev_row_index = row_index
-                    self.v1_table.setItem(prev_row_index, 0, QTableWidgetItem(row['GROW_NM']))
-                self.v1_table.setSpan(prev_row_index, 0, row_index - prev_row_index + 1, 1)
-                self.v1_table.setItem(row_index, 1, QTableWidgetItem(row['BIRTH_CNT']))
-            else:
-                self.v1_table.setSpan(row_index, 0, 1, 2)
-                merged_item = QTableWidgetItem(f"{row['GROW_NM']} {row['BIRTH_CNT']}")
-                self.v1_table.setItem(row_index, 0, merged_item)
-
-            self.v1_table.setItem(row_index, 2, QTableWidgetItem(str(row['합계'])))
-            self.v1_table.setItem(row_index, 3, QTableWidgetItem(str(row['1A'])))
-            self.v1_table.setItem(row_index, 4, QTableWidgetItem(str(row['1B'])))
-            self.v1_table.setItem(row_index, 5, QTableWidgetItem(str(row['2A'])))
-            self.v1_table.setItem(row_index, 6, QTableWidgetItem(str(row['2B'])))
-            self.v1_table.setItem(row_index, 7, QTableWidgetItem(str(row['3A'])))
-            self.v1_table.setItem(row_index, 8, QTableWidgetItem(str(row['3B'])))
-            self.v1_table.setItem(row_index, 9, QTableWidgetItem(str(row['4A'])))
-            self.v1_table.setItem(row_index, 10, QTableWidgetItem(str(row['4B'])))
-            self.v1_table.setItem(row_index, 11, QTableWidgetItem(str(row['5A'])))
-            self.v1_table.setItem(row_index, 12, QTableWidgetItem(str(row['5B'])))
-            self.v1_table.setItem(row_index, 13, QTableWidgetItem(str(row['6A'])))
-
-            if row['GROW_NM'] == "합계":
-                for col in range(self.v1_table.columnCount()):
-                    item = self.v1_table.item(row_index, col)
-                    if item:
-                        item.setBackground(QBrush(QColor("#763500")))
-                        item.setForeground(QBrush(QColor("white")))
-                        item.setFont(QFont("Arial", weight=QFont.Bold))
-
-        # 중앙 정렬 설정
-        for i in range(self.v1_table.rowCount()):
-            for j in range(self.v1_table.columnCount()):
-                item = self.v1_table.item(i, j)
-                if item:
-                    item.setTextAlignment(Qt.AlignCenter)
-
-        # 테이블의 높이를 행 수에 맞게 조절
-        row_height = self.v1_table.verticalHeader().defaultSectionSize()
-        self.v1_table.setFixedHeight(row_height * self.v1_table.rowCount() + self.v1_table.horizontalHeader().height() + 2)
-
-    """"""""""""""""""""""""""""""""" 
-    start-v2 : 일별 착유 현황 추이 (차트)
-    """""""""""""""""""""""""""""""""
-
-    def v2_data_chart(self, data):
-        v2_chart_data = data
-
-        # 데이터가 None이면 반환
-        if v2_chart_data is None:
-            self.v2_data = None
-            return
-
-        # 이전 데이터와 동일한 경우 업데이트 중단
-        if self.v2_data is not None and v2_chart_data.equals(self.v2_data):
-            return
-
-        self.v2_data = v2_chart_data
-
-        fig = go.Figure()
-        fig.add_trace(go.Bar(
-            x=v2_chart_data['YMD'],
-            y=v2_chart_data['COW_CNT'],
-            name='두수',
-            marker_color="#1f77b4",
-            textposition='none',  # 막대바 값 텍스트 제거
-            yaxis='y1'
-        ))
-        fig.add_trace(go.Scatter(
-            x=v2_chart_data['YMD'],
-            y=v2_chart_data['MILK_QTY'],
-            name='착유량',
-            mode='lines+markers+text',
-            marker_color="#ff7f0e",
-            line=dict(color="#ff7f0e", width=2),
-            text=[f"{x:,.2f}" for x in v2_chart_data['MILK_QTY']],
-            textposition='top center',
-            textfont=dict(color="black", size=15),  # 텍스트 색상을 흰색으로 설정
-            yaxis='y2'
-        ))
-        fig.update_layout(
-            title_text="<b>일별 착유 현황 추이 그래프(2주간)</b>",
-            title_font_size=20,
-            template="simple_white",
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            xaxis=dict(
-                tickformat="%m.%d",
-                color="black",
-                dtick="D1",
-                tickfont=dict(size=18),
-                gridcolor="lightgray"  # X축 가로선 색상 설정
-            ),
-            yaxis=dict(
-                title="",
-                color="black",
-                dtick=100,
-                tickfont=dict(size=18),
-                gridcolor="lightgray"  # Y축 가로선 색상 설정
-            ),
-            yaxis2=dict(
-                title="",
-                overlaying='y',
-                side='right',
-                color="black",
-                showgrid=True,  # Y2축에 가로선 표시
-                gridcolor="lightgray",  # Y2축 가로선 색상 설정
-                dtick=1000,
-                tickfont=dict(size=18)
-            ),
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.1,
-                xanchor="center",
-                x=0.5,
-                font=dict(size=20, color="black")
-            ),
-            margin=dict(t=80)  # 상단 여백 추가하여 텍스트가 잘리지 않도록 설정
-        )
-
-        # HTML 생성 및 업데이트
-        self.v2_chart_view.setHtml(self.generate_html(fig.to_json()))
-
-    """"""""""""""""""""""""""""""""" 
-    start-v3 : 축주별 사육 현황 (테이블)  
-    """""""""""""""""""""""""""""""""
-    def v3_header(self):     # v3 table data setting
-        self.v3_table.setRowCount(2)  # 타이틀 행을 위해 행 개수 설정
-        self.v3_table.setColumnCount(12)  # 필요한 열 개수 설정
-
-        # 첫 번째 타이틀 "축주"
-        self.v3_table.setSpan(0, 0, 2, 1)  # 2행에 걸쳐 1열 병합
-        title_item = QTableWidgetItem("축주")
-        title_item.setFont(QFont("Arial", weight=QFont.Bold))
-        title_item.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v3_table.setItem(0, 0, title_item)
-
-        # "착유량" 헤더 및 하위 항목 설정
-        self.v3_table.setSpan(0, 1, 1, 2)  # 3개의 열 병합
-        milking_title = QTableWidgetItem("착유량")
-        milking_title.setFont(QFont("Arial", weight=QFont.Bold))
-        milking_title.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v3_table.setItem(0, 1, milking_title)
-
-        # "산차별 착유 두수" 헤더 및 하위 항목 설정
-        self.v3_table.setSpan(0, 3, 1, 6)  # 6개의 열 병합
-        parity_title = QTableWidgetItem("산차별 착유 두수")
-        parity_title.setFont(QFont("Arial", weight=QFont.Bold))
-        parity_title.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v3_table.setItem(0, 3, parity_title)
-
-        self.v3_table.setSpan(0, 9, 1, 1)  # 각 열을 개별 타이틀로 설정
-        sub_header_choimansak = QTableWidgetItem("초임만삭")
-        sub_header_choimansak.setFont(QFont("Arial", weight=QFont.Bold))
-        sub_header_choimansak.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v3_table.setItem(0, 9, sub_header_choimansak)
-
-        sub_header_gunyuu = QTableWidgetItem("건유우")
-        sub_header_gunyuu.setFont(QFont("Arial", weight=QFont.Bold))
-        sub_header_gunyuu.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v3_table.setItem(0, 10, sub_header_gunyuu)
-
-        sub_header_total = QTableWidgetItem("합계")
-        sub_header_total.setFont(QFont("Arial", weight=QFont.Bold))
-        sub_header_total.setBackground(QBrush(QColor("#4B4B4B")))
-        self.v3_table.setItem(0, 11, sub_header_total)
-
-        # set_result_sub_header 설정
-        result_sub_headers = [
-            (1, "유량"), (2, "두당"), (3, "1산"),
-            (4, "2산"), (5, "3산"), (6, "4산"),
-            (7, "5산~"), (8, "계"), (9, "초임만삭"),
-            (10, "건유우"), (11, "합계")
-        ]
-
-        for column, text in result_sub_headers:
-            self.v3_sub_header(column, text)
-
-        # 중앙 정렬 적용
-        for i in range(2):  # 타이틀 행만 중앙 정렬
-            for j in range(13):
-                item = self.v3_table.item(i, j)
-                if item:
-                    item.setTextAlignment(Qt.AlignCenter)
-
-    def v3_sub_header(self, column, text):  # v3 table sub header
-        sub_result_header_item = QTableWidgetItem(text)
-        sub_result_header_item.setFont(QFont("Arial", 9, QFont.Bold))
-        sub_result_header_item.setBackground(QBrush(QColor("#5C5C5C")))
-        self.v3_table.setItem(1, column, sub_result_header_item)
-
-    def v3_data_table(self, data):    #v3 table data
-        df = data
-        # 새 데이터가 이전 데이터와 같으면 업데이트 중단
-        if df is None or df.equals(self.v3_data):
-            return
-
-        # 데이터가 변경된 경우에만 테이블 업데이트 수행
-        self.v3_data = df  # 새로운 데이터를 이전 데이터로 저장
-
-        data_row_count = len(df)
-        self.v3_table.setRowCount(data_row_count + 3)  # 데이터 행 + 타이틀 행 + 합계 행 포함
-
-        # 데이터 삽입
-        for row_idx, row in df.iterrows():
-            for col_idx, value in enumerate(row):
-                # 값이 0이면 빈 문자열로 표시
-                if value == 0:
-                    formatted_value = ""  # 0을 빈 문자열로 대체
-                elif col_idx == 1:  # 유량 열일 경우 천 단위 구분 기호 및 소수점 두 자리까지 표시
-                    formatted_value = f"{value:,.1f}"  # 천 단위 구분 기호와 소수점 두 자리 포맷
-                else:
-                    formatted_value = str(value)
-
-                cell = QTableWidgetItem(formatted_value)
-                cell.setTextAlignment(Qt.AlignCenter)
-                self.v3_table.setItem(row_idx + 2, col_idx, cell)  # 데이터 행은 타이틀 밑에서 시작
-
-        # 합계 행 계산 및 삽입
-        total_row = data_row_count + 2  # 마지막 데이터 행 바로 아래에 합계 행 추가
-        total_label_cell = QTableWidgetItem("합계")  # "합계" 텍스트 설정
-        total_label_cell.setTextAlignment(Qt.AlignCenter)  # 텍스트를 가운데 정렬
-        self.v3_table.setItem(total_row, 0, total_label_cell)
-
-        # 각 열의 합계 계산
-        for col_idx in range(1, self.v3_table.columnCount()):
-            if col_idx in [1, 2]:  # 유량과 두당 열에 대해 합계 계산
-                column_sum = df.iloc[:, col_idx].sum()  # 해당 열의 합계 계산
-                if col_idx == 1:  # 유량 열일 경우 천 단위 구분 기호와 소수점 한 자리까지 표시
-                    formatted_sum = f"{column_sum:,.1f}"
-                else:
-                    formatted_sum = str(column_sum)
-            elif pd.api.types.is_numeric_dtype(df.iloc[:, col_idx]):
-                column_sum = df.iloc[:, col_idx].sum()
-                formatted_sum = str(column_sum) if column_sum != 0 else ""  # 숫자 열의 합계가 0이면 빈 문자열로 표시
-            else:
-                formatted_sum = ""  # 숫자가 아닌 열은 합계 계산 안 함
-
-            total_cell = QTableWidgetItem(formatted_sum)
-            total_cell.setTextAlignment(Qt.AlignCenter)
-            self.v3_table.setItem(total_row, col_idx, total_cell)
-
-        # 합계 행 스타일 설정
-        for col_idx in range(self.v3_table.columnCount()):
-            item = self.v3_table.item(total_row, col_idx)
-            if item:
-                item.setFont(QFont("Arial", weight=QFont.Bold))
-                item.setBackground(QBrush(QColor("#763500")))  # 합계 행의 색상 설정
-                item.setForeground(QBrush(QColor("white")))  # 텍스트 색상 설정
-
-        # 테이블의 높이를 행 수에 맞게 조절
-        row_height = self.v3_table.verticalHeader().defaultSectionSize()
-        self.v3_table.setFixedHeight(
-            row_height * self.v3_table.rowCount() + self.v3_table.horizontalHeader().height() + 2)
-
-    """""""""""""""""""""""""""""""""""""""""""""
-    start-v4 : 우군별 비육일수별 산유량 분포 (차트)
-    """""""""""""""""""""""""""""""""""""""""""""
-    def v4_data_chart(self, data):
-        v4_chart_data = data  # 데이터가 None이면 반환
-
-        if v4_chart_data is None:
-            # 오류 발생 시 이전 데이터를 초기화하여 다음에 정상 데이터가 로드될 때 업데이트되도록 합니다.
-            self.v4_data = None
-            return
-
-        # 이전 데이터와 동일한 경우 업데이트 중단
-        if self.v4_data is not None and v4_chart_data.equals(self.v4_data):
-            return
-
-        # 데이터가 변경된 경우에만 테이블 업데이트 수행
-        self.v4_data = v4_chart_data  # 새로운 데이터를 이전 데이터로 저장
-
-        dist_fig = go.Figure()
-        for birth_cnt in v4_chart_data['V_BIRTH_CNT'].unique():
-            filtered_df = v4_chart_data[v4_chart_data['V_BIRTH_CNT'] == birth_cnt]
-            dist_fig.add_trace(go.Scatter(
-                x=filtered_df['DD'],
-                y=filtered_df['milk_weight'],
-                mode='markers',
-                name=f"산차수 {birth_cnt}",
-                marker=dict(size=8, opacity=0.7)
-            ))
-
-        dist_fig.update_layout(
-            title="<b>우군별 비유일수별 산유량 분포</b>",
-            title_font_size=20,
-            xaxis_title="",
-            yaxis_title="",
-            template="simple_white",
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            xaxis=dict(
-                color="black",
-                tickfont=dict(size=18, family="Arial Bold", color="black"),  # X축 눈금 텍스트를 굵게 설정
-                showgrid=True,  # Y2축에 가로선 표시
-                gridcolor="lightgrey"  # X축 가로선 색상 설정
-            ),
-            yaxis=dict(
-                color="black",
-                tickfont=dict(size=18, family="Arial Bold", color="black"),  # Y축 눈금 텍스트를 굵게 설정
-                showgrid=True,  # Y2축에 가로선 표시
-                gridcolor="lightgrey"  # Y축 가로선 색상 설정
-            ),
-            legend=dict(
-                orientation="h",  # 가로 방향으로 범례 표시
-                yanchor="bottom",  # y축 고정 위치를 아래쪽으로 설정
-                y=1.1,  # y 위치를 위로 설정 (1보다 크게 설정)
-                xanchor="center",  # x축 고정 위치를 가운데로 설정
-                x=0.5,  # x 위치를 가운데로 설정
-                font=dict(size=18, color="black"),  # 범례 텍스트 색상 및 크기
-                traceorder="normal"
-            )
-        )
-
-        # HTML 생성 및 업데이트
-        self.v4_chart_view.setHtml(self.generate_html(dist_fig.to_json()))
-
-    """""""""""""""""""""""""""""""""""""""""""""
-    start-v5 : 산차별 구성비 (차트)
-    """""""""""""""""""""""""""""""""""""""""""""
-
-    def v5_data_chart(self, data):
-        v5_chart_data = data  # 데이터가 None이면 반환
-
-        if v5_chart_data is None:
-            # 오류 발생 시 이전 데이터를 초기화하여 다음에 정상 데이터가 로드될 때 업데이트되도록 합니다.
-            self.v5_data = None
-            return
-
-        # 이전 데이터와 동일한 경우 업데이트 중단
-        if self.v5_data is not None and v5_chart_data.equals(self.v5_data):
-            return
-
-        # 데이터가 변경된 경우에만 테이블 업데이트 수행
-        self.v5_data = v5_chart_data  # 새로운 데이터를 이전 데이터로 저장
-
-        # 각 비율 값을 추출
-        values = [
-            v5_chart_data['MILKING_1'].iloc[0],
-            v5_chart_data['MILKING_2'].iloc[0],
-            v5_chart_data['MILKING_3'].iloc[0],
-            v5_chart_data['MILKING_4'].iloc[0],
-            v5_chart_data['MILKING_5'].iloc[0],
-        ]
-
-        labels = ['1산', '2산', '3산', '4산', '5산+']
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']  # 흰색 배경에서 잘 보이는 색상
-
-        # 스택형 구성비 차트 생성
-        fig = go.Figure()
-
-        # 각 항목을 개별적으로 추가하여 스택형으로 표시
-        for label, value, color in zip(labels, values, colors):
-            fig.add_trace(go.Bar(
-                x=[value],
-                y=[""],
-                name=label,
-                orientation='h',
-                marker=dict(color=color),
-                text=f"{value:.1f}%",  # 소수점 1자리로 표시
-                textposition='inside',
-                textfont=dict(size=20, family="Arial Bold"),
-                insidetextanchor='middle',  # 텍스트가 중앙에 정렬되도록 설정
-                width=0.6  # 바의 두께를 조절
-            ))
-        fig.update_layout(
-            barmode='stack',
-            xaxis=dict(
-                title="",  # X축 제목을 굵게 설정
-                titlefont=dict(size=15, color="black"),
-                tickvals=[0, 20, 40, 60, 80, 100],
-                ticktext=["<b>0%</b>", "<b>20%</b>", "<b>40%</b>", "<b>60%</b>", "<b>80%</b>", "<b>100%</b>"],
-                # % 기호를 포함한 X축 눈금을 굵게 설정
-                range=[0, 100],
-                showgrid=True,
-                gridcolor="lightgray",  # X축 가로선 색상 설정
-                tickfont=dict(size=15, color="black")  # X축 눈금 텍스트를 굵게 설정
-            ),
-            yaxis=dict(
-                title="",  # Y축 제목을 굵게 설정
-                titlefont=dict(size=15, color="black"),
-                showgrid=False,
-                tickfont=dict(size=15, color="black")  # Y축 눈금 텍스트를 굵게 설정
-            ),
-            showlegend=True,
-            legend=dict(
-                orientation="h",
-                yanchor="bottom",
-                y=1.1,
-                xanchor="center",
-                x=0.5,
-                font=dict(size=15, color="black")  # 굵은 글꼴로 설정
-            ),
-            title="<b>산차별 구성비</b>",  # 차트 제목을 굵게 설정
-            title_font_size=18,
-            plot_bgcolor="white",
-            paper_bgcolor="white",
-            template="simple_white"
-        )
-
-        # HTML 생성 및 업데이트
-        self.v5_chart_view.setHtml(self.generate_html(fig.to_json()))
-
-    """""""""""""""""""""""""""""""""""""""""""""
-    start-v6 : 두당 산유량 분포 (table)
-    """""""""""""""""""""""""""""""""""""""""""""
-    def v6_table_header(self):
-        headers = ["산차수", "합 계", "~ 15", "16 ~ 20", "21 ~ 26", "26 ~ 30", "31 ~ 35", "36 ~ 40", "41 ~"]
-        self.v6_table.setColumnCount(len(headers))
-        self.v6_table.setRowCount(1)  # 첫 번째 행에 헤더 추가
-        for i, header_text in enumerate(headers):
-            header_item = QTableWidgetItem(header_text)
-            header_item.setFont(QFont("Arial", weight=QFont.Bold))
-            header_item.setTextAlignment(Qt.AlignCenter)
-            header_item.setBackground(QBrush(QColor("#4B4B4B")))
-            header_item.setForeground(QBrush(QColor("white")))
-            self.v6_table.setItem(0, i, header_item)
-
-    def v6_data_table(self, data):    # v6 두당 산유량 분포
-        df = data
-        # 새 데이터가 이전 데이터와 같으면 업데이트 중단
-        if df is None or df.equals(self.v6_data):
-            return
-
-        # 데이터가 변경된 경우에만 테이블 업데이트 수행
-        self.v6_data = df  # 새로운 데이터를 이전 데이터로 저장
-
-        # 열 수를 데이터프레임의 열 수로 설정
-        self.v6_table.setColumnCount(len(df.columns))
-        self.v6_table.setRowCount(1 + len(df))  # 헤더 행 + 데이터 행
-
-        # 헤더 설정 (열 이름을 테이블 상단에 추가)
-        for col_idx, col_name in enumerate(df.columns):
-            header_item = QTableWidgetItem(col_name)
-            header_item.setFont(QFont("Arial", weight=QFont.Bold))
-            header_item.setTextAlignment(Qt.AlignCenter)
-            header_item.setBackground(QBrush(QColor("#4B4B4B")))
-            header_item.setForeground(QBrush(QColor("white")))
-            self.v6_table.setHorizontalHeaderItem(col_idx, header_item)
-
-        # 데이터 채우기 및 합계 행 스타일 설정
-        for row_idx, row in df.iterrows():
-            is_total_row = (row.iloc[0] == "합계")  # 첫 번째 열이 "합계"인지 확인
-            for col_idx, value in enumerate(row):
-                cell = QTableWidgetItem(str(value))
-                cell.setTextAlignment(Qt.AlignCenter)
-
-                # "합계" 행의 스타일 변경
-                if is_total_row:
-                    cell.setBackground(QBrush(QColor("#763500")))  # 배경색 설정
-                    cell.setForeground(QBrush(QColor("white")))  # 텍스트 색상 설정
-                    cell.setFont(QFont("Arial", weight=QFont.Bold))  # 폰트 굵게 설정
-
-                self.v6_table.setItem(row_idx + 1, col_idx, cell)
-
-        # 테이블 높이를 모든 행이 보이도록 조정
-        row_height = self.v6_table.verticalHeader().defaultSectionSize()
-        self.v6_table.setFixedHeight((row_height * self.v6_table.rowCount()) + self.v6_table.horizontalHeader().height() + 2)
-
-    """""""""""""""""""""""""""""""""""""""""""""
-    start-v7 : 두당 산유량 구성비 (chart)
-    """""""""""""""""""""""""""""""""""""""""""""
-    def v7_data_chart(self, data):
-        v7_chart_data = data
-
-        if v7_chart_data is None:
-            # 오류 발생 시 이전 데이터를 초기화하여 다음에 정상 데이터가 로드될 때 업데이트되도록 합니다.
-            self.v7_data = None
-            return
-
-        # 이전 데이터와 동일한 경우 업데이트 중단 (단, self.v2_data가 None이 아닐 때만)
-        if self.v7_data is not None and v7_chart_data.equals(self.v7_data):
-            return
-        # 데이터가 변경된 경우에만 테이블 업데이트 수행
-        self.v7_data = v7_chart_data  # 새로운 데이터를 이전 데이터로 저장
-
-        # CNT_1 ~ CNT_7 값을 추출합니다.
-        values = [
-            v7_chart_data['CNT_1'].iloc[0],
-            v7_chart_data['CNT_2'].iloc[0],
-            v7_chart_data['CNT_3'].iloc[0],
-            v7_chart_data['CNT_4'].iloc[0],
-            v7_chart_data['CNT_5'].iloc[0],
-            v7_chart_data['CNT_6'].iloc[0],
-            v7_chart_data['CNT_7'].iloc[0],
-        ]
-
-        labels = ['~15', '16~20', '21~26', '26~30', '31~35', '31~35', '36~40']
-        colors = ['#4A90E2', '#F5A623', '#9B9B9B', '#F8E71C', '#7ED321', '#50E3C2', '#B8E986']
-
-        # 새로운 스택형 구성비 차트를 추가
-        fig = go.Figure()
-
-        for label, value, color in zip(labels, values, colors):
-            fig.add_trace(go.Bar(
-                x=[value],
-                y=[""],
-                name=label,
-                orientation='h',
-                marker=dict(color=color),
-                text=f"{value:.1f}%",
-                textposition='inside',
-                textfont=dict(size=15, family="Arial Bold"),
-                insidetextanchor='middle',
-                width=0.4
-            ))
-
-        fig.update_layout(
-            barmode='stack',
-            xaxis=dict(
-                title="",
-                tickvals=[0, 20, 40, 60, 80, 100],
-                ticktext=["0%", "20%", "40%", "60%", "80%", "100%"],
-                range=[0, 100],
-                showgrid=True
-            ),
-            yaxis=dict(
-                title="",
-                showgrid=False
-            ),
-            showlegend=True,
-            legend=dict(
-                orientation="h",  # 가로 방향으로 범례 표시
-                yanchor="bottom",  # y축 고정 위치를 아래쪽으로 설정
-                y=1.1,  # y 위치를 위로 설정 (1보다 크게 설정)
-                xanchor="center",  # x축 고정 위치를 가운데로 설정
-                x=0.5,  # x 위치를 가운데로 설정
-                font=dict(color="white"),  # 범례 텍스트 색상
-                traceorder = "normal"
-            ),
-            title="두당 산유량 구성비",
-            template="plotly_dark",
-        )
-
-        fig_json = fig.to_json()
-        html_chart = self.generate_html(fig_json)
-        self.v7_chart_view.setHtml(html_chart)
-
-    def generate_html(self, fig_json):
-        """Plotly 차트를 표시하기 위한 HTML 생성 메서드"""
-        return f"""
-        <html>
-        <head>
-            <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-        </head>
-        <body style="margin:0;">
-            <div id="chart" style="width:100%; height:100%;"></div>
-            <script>
-                var fig_data = {fig_json};
-                Plotly.newPlot("chart", fig_data.data, fig_data.layout, {{responsive: true}});
-            </script>
-        </body>
-        </html>
-        """
-
-    def create_error_overlay(self, table_widget):
-        """표 위에 오류 메시지를 표시할 라벨을 생성하고 크기를 자동 조정합니다."""
-        error_overlay = QLabel("데이터베이스 오류 발생", table_widget)
-        error_overlay.setStyleSheet("color: red; background-color: rgba(50, 50, 50, 0.7); font-size: 15px;")
-        error_overlay.setAlignment(Qt.AlignCenter)
-        error_overlay.setGeometry(0, 0, table_widget.width(), table_widget.height())
-        error_overlay.setWordWrap(True)  # 메시지가 길어질 경우 줄바꿈 허용
-        return error_overlay
-
-    def resizeEvent(self, event):
-        """창 크기가 변경될 때마다 에러 오버레이 크기를 조정합니다."""
-        super().resizeEvent(event)
-        self.adjust_error_overlay_size(self.v1_error_overlay, self.v1_table)
-        self.adjust_error_overlay_size(self.v3_error_overlay, self.v3_table)
-        self.adjust_error_overlay_size(self.v6_error_overlay, self.v6_table)
-
-    def adjust_error_overlay_size(self, overlay, table_widget):
-        """에러 오버레이의 크기를 table_widget에 맞게 조정합니다."""
-        overlay.setGeometry(0, 0, table_widget.width(), table_widget.height())
-
-    def show_error_overlay(self, overlay, message):
-        """에러 메시지 오버레이를 표시합니다."""
-        overlay.setText(message)
-        overlay.show()
-
-    def hide_error_overlay(self, overlay):
-        """에러 메시지 오버레이를 숨깁니다."""
-        overlay.hide()
-
-    def fetch_data_with_error_handling(self, param1, param2, target_view):
+        self.timer.timeout.connect(self.check_time_for_auto_start_stop)
+        self.timer.start(60000)
+
+        # 프로그램 실행 후 바로 시간 체크를 한 번 호출
+        self.check_time_for_auto_start_stop()  # <-- 이 부분 추가
+
+    def check_time_for_auto_start_stop(self):
+        current_time = QTime.currentTime()
+
+        # 입력된 오전 시작 시간
+        am_start_hour = int(self.am_start_hour_input.text())
+        am_start_minute = int(self.am_start_minute_input.text())
+
+        # 입력된 오전 종료 시간
+        am_end_hour = int(self.am_end_hour_input.text())
+        am_end_minute = int(self.am_end_minute_input.text())
+
+        # 입력된 오후 시작 시간
+        pm_start_hour = int(self.pm_start_hour_input.text())
+        pm_start_minute = int(self.pm_start_minute_input.text())
+
+        # 입력된 오후 종료 시간
+        pm_end_hour = int(self.pm_end_hour_input.text())
+        pm_end_minute = int(self.pm_end_minute_input.text())
+
+        # 현재 시간이 오전 시작 시간과 종료 시간 사이일 때만 작업 시작
+        if (current_time.hour() > am_start_hour or (
+                current_time.hour() == am_start_hour and current_time.minute() >= am_start_minute)) and \
+                (current_time.hour() < am_end_hour or (
+                        current_time.hour() == am_end_hour and current_time.minute() < am_end_minute)):
+            # 오전 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
+            if not self.worker or not self.worker.isRunning():
+                self.start_data_collection()
+
+        # 현재 시간이 오후 시작 시간과 종료 시간 사이일 때만 작업 시작
+        elif (current_time.hour() > pm_start_hour or (
+                current_time.hour() == pm_start_hour and current_time.minute() >= pm_start_minute)) and \
+                (current_time.hour() < pm_end_hour or (
+                        current_time.hour() == pm_end_hour and current_time.minute() < pm_end_minute)):
+            # 오후 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
+            if not self.worker or not self.worker.isRunning():
+                self.start_data_collection()
+
+        # 현재 시간이 오전 종료 시간을 지났을 경우 멈춤
+        elif current_time.hour() > am_end_hour or (
+                current_time.hour() == am_end_hour and current_time.minute() >= am_end_minute):
+            if self.worker and self.worker.isRunning():
+                self.stop_data_collection()
+
+        # 현재 시간이 오후 종료 시간을 지났을 경우 멈춤
+        elif current_time.hour() > pm_end_hour or (
+                current_time.hour() == pm_end_hour and current_time.minute() >= pm_end_minute):
+            if self.worker and self.worker.isRunning():
+                self.stop_data_collection()
+
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+        self.tray_icon.show()
+
+    def on_tray_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_window()
+
+    def show_window(self):
+        self.show()
+        self.tray_icon.hide()
+
+    def quit_app(self):
+        QApplication.quit()
+
+    def start_data_collection(self):
         try:
-            data = fetch_data(param1, param2)  # 데이터 가져오기 시도
-            if data is None or data.empty:
-                raise ValueError("데이터가 없습니다.")
-            # 데이터가 정상적으로 로드되면 오류 메시지 숨기기
-            if isinstance(target_view, QTableWidget):
-                self.hide_error_overlay(self.get_error_overlay(target_view))
-            elif isinstance(target_view, QWebEngineView):
-                # param1 값에 따라 각 차트 함수 호출
-                if param1 == 'V2':
-                    self.v2_data_chart(data)
-                elif param1 == 'V4':
-                    self.v4_data_chart(data)
-                elif param1 == 'V5':
-                    self.v5_data_chart(data)
-                elif param1 == 'V7':
-                    self.v7_data_chart(data)
-            return data  # 성공 시 데이터 반환
-        except Exception as e:
-            # 오류 발생 시 메시지 표시
-            error_message = f"데이터베이스 오류 발생: {str(e)}"
-            if isinstance(target_view, QTableWidget):
-                self.show_error_overlay(self.get_error_overlay(target_view), error_message)
-            elif isinstance(target_view, QWebEngineView):
-                error_html = f"<html><body style='background-color: #333; color:red; text-align:center;'><p>{error_message}</p></body></html>"
-                target_view.setHtml(error_html)
-            return None
+            interval = int(self.interval_input.text())
+            if interval < 10:
+                raise ValueError
+        except ValueError:
+            self.append_text("수집 주기는 10초 이상의 양수로 입력해주세요.\n")
+            return
 
-    def get_error_overlay(self, table_widget):
-        """주어진 QTableWidget에 대응하는 에러 오버레이를 반환합니다."""
-        if table_widget == self.v1_table:
-            return self.v1_error_overlay
-        elif table_widget == self.v3_table:
-            return self.v3_error_overlay
-        elif table_widget == self.v6_table:
-            return self.v6_error_overlay
-        return None
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
 
-# 실행
-app = QApplication(sys.argv)
-window = MainWindow()
-window.showMaximized()
-app.exec_()
+        self.worker = DataWorker(interval)
+        self.worker.update_text.connect(self.append_text)
+        self.worker.finished.connect(self.on_data_collection_finished)
+        self.worker.start()
+
+    def stop_data_collection(self):
+        if self.worker:
+            self.worker.stop()
+
+    def on_data_collection_finished(self):
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.append_text("-> 데이터 수집이 정지되었습니다.\n")
+
+    def append_text(self, text):
+        self.text_edit.append(text)
+        self.text_edit.ensureCursorVisible()
+
+        max_lines = 500
+        if self.text_edit.document().blockCount() > max_lines:
+            cursor = self.text_edit.textCursor()
+            cursor.movePosition(cursor.Start)
+            cursor.select(cursor.BlockUnderCursor)
+            cursor.removeSelectedText()
+            cursor.deleteChar()
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    icon_path = resource_path("milking.png")
+    app.setWindowIcon(QIcon(icon_path))
+    window = MainWindow()
+    window.show()
+    sys.exit(app.exec_())

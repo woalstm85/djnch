@@ -2,17 +2,17 @@ import sys
 import os
 import pandas as pd
 import logging
+import json
 from logging.handlers import TimedRotatingFileHandler
 import time
 from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, \
-    QLabel, QLineEdit, QSystemTrayIcon, QMenu, QAction
+    QLabel, QLineEdit, QSystemTrayIcon, QMenu, QAction, QProgressBar
 from PyQt5.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker, Qt
 from PyQt5.QtGui import QIcon
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError, OperationalError, TimeoutError
 from datetime import datetime
 from PyQt5.QtCore import QTime
-
 
 # 리소스 파일에 접근할 수 있도록 경로 설정 함수
 def resource_path(relative_path):
@@ -22,7 +22,7 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
-# 로그 파일 이름 고정
+# 로그 파일 설정
 log_file_name = "data_activity.log"
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
@@ -34,43 +34,52 @@ logger.addHandler(log_handler)
 
 # PostgreSQL 및 MSSQL 연결 설정
 pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
-#pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
 mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
 pg_engine = create_engine(pg_connection_string)
 mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
 
 class DataWorker(QThread):
     update_text = pyqtSignal(str)
+    update_progress = pyqtSignal(int)  # 프로그레스바 업데이트 신호 추가
     finished = pyqtSignal()
 
-    def __init__(self, interval):
+    def __init__(self, interval, am_end_time, pm_end_time):
         super().__init__()
         self.interval = interval
+        self.am_end_time = am_end_time
+        self.pm_end_time = pm_end_time
         self.stop_requested = False
         self.mutex = QMutex()
 
     def run(self):
-        max_retries = 3  # 최대 재시도 횟수
-        retry_delay = 5  # 재시도 대기 시간 (초)
+        max_retries = 3
+        retry_delay = 10
 
         while not self.stop_requested:
+            # 현재 시간이 설정된 종료 시간을 지났다면 자동으로 멈춤
+            current_time = QTime.currentTime()
+            if current_time >= self.am_end_time and current_time < QTime(12, 0):
+                self.update_text.emit("-> 오전 종료 시간에 도달하여 데이터 수집을 중지합니다.\n")
+                break
+            elif current_time >= self.pm_end_time:
+                self.update_text.emit("-> 오후 종료 시간에 도달하여 데이터 수집을 중지합니다.\n")
+                break
+
             start_time = time.time()
             retries = 0  # 현재 재시도 횟수 초기화
 
-            while retries <= max_retries and not self.stop_requested:
+            while retries < max_retries and not self.stop_requested:
                 try:
                     start_time_display = datetime.now().strftime('%Y.%m.%d %H:%M:%S')
                     self.update_text.emit(f"***********************************************\n")
                     self.update_text.emit(f"-> 데이터 수집 시작 시간 : {start_time_display}\n")
                     logger.info(f"데이터 수집 시작 시간 : {start_time_display}")
 
-                    # MSSQL에서 최대 milking_id 값 조회
                     with mssql_engine.connect() as mssql_conn:
                         max_activity_id = mssql_conn.execute(
                             text("SELECT ISNULL(MAX(cowactivity_id), 0) FROM ICT_ACTIVITY_LOG")
                         ).scalar()
 
-                    # PostgreSQL에서 데이터 가져오기
                     with pg_engine.connect() as pg_conn:
                         query = text("""
                                 SELECT a.cowactivity_id
@@ -98,56 +107,58 @@ class DataWorker(QThread):
                     if pg_row_count == 0:
                         self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
                     else:
-                        # 데이터프레임으로 변환
                         df = pd.DataFrame(data, columns=["cowactivity_id", "cow_id", "cow_number", "cow_name", "counts", "counts_perhr", "cow_activity", "ymd", "hms"])
-
                         records = df.to_dict(orient='records')
                         with mssql_engine.connect() as conn:
-                            postgresql_complete_time = time.time() # PostgreSQL에서 데이터를 가져온 후, 완료 시점 시간 기록
-                            for i in range(0, len(records), 500):  # 500개씩 배치 처리
-                                batch = records[i:i + 500]
-                                for record in batch:  # 각 record를 저장 프로시저에 전달
-                                    conn.execute(text("""
-                                        EXEC P_ICT_ACTIVITY_LOG_M 
-                                            @cowactivity_id=:cowactivity_id, @cow_id=:cow_id, @cow_number=:cow_number, @cow_name=:cow_name, @counts=:counts, 
-                                            @counts_perhr=:counts_perhr, @cow_activity=:cow_activity, @ymd=:ymd,@hms=:hms
-                                    """), record)
-                            conn.commit()  # 배치 처리 후 커밋
+                            postgresql_complete_time = time.time()
+                            transaction_started = False
+
+                            try:
+                                for i in range(0, len(records), 500):
+                                    batch = records[i:i + 500]
+
+                                    if not transaction_started:
+                                        conn.begin()
+                                        transaction_started = True
+
+                                    for record in batch:
+                                        conn.execute(text("""
+                                            EXEC P_ICT_ACTIVITY_LOG_M 
+                                                @cowactivity_id=:cowactivity_id, @cow_id=:cow_id, @cow_number=:cow_number, @cow_name=:cow_name, @counts=:counts, 
+                                                @counts_perhr=:counts_perhr, @cow_activity=:cow_activity, @ymd=:ymd,@hms=:hms
+                                        """), record)
+
+                                    progress = int((i + len(batch)) / len(records) * 100)
+                                    self.update_progress.emit(progress)
+
+                                conn.commit()
+                            except SQLAlchemyError as e:
+                                if transaction_started:
+                                    conn.rollback()
+                                raise e
 
                         mssql_duration = time.time() - postgresql_complete_time
                         self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
                         self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
                         logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
-                    break  # 재시도 성공 시 루프 탈출
+                    break
 
-                # 구체적인 예외 처리 추가
-                except OperationalError as e:
+                except (OperationalError, TimeoutError, SQLAlchemyError) as e:
                     retries += 1
-                    self.update_text.emit(f"-> OperationalError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"OperationalError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
-                    time.sleep(retry_delay)
+                    self.update_text.emit(f"-> {type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
+                    logger.warning(f"{type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
 
-                except TimeoutError as e:
-                    retries += 1
-                    self.update_text.emit(f"-> TimeoutError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"TimeoutError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
-                    time.sleep(retry_delay)
+                    if retries < max_retries:
+                        time.sleep(retry_delay)
 
-                except SQLAlchemyError as e:
-                    retries += 1
-                    self.update_text.emit(f"-> SQLAlchemyError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"SQLAlchemyError 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
-                    time.sleep(retry_delay)
-
-                finally:
-                    end_time = time.time()
-                    elapsed_time = end_time - start_time
-                    remaining_time = self.interval - elapsed_time
-                    if remaining_time > 0:
-                        for _ in range(int(remaining_time / 0.1)):
-                            if self.stop_requested:
-                                break
-                            time.sleep(0.1)
+            elapsed_time = time.time() - start_time
+            remaining_time = self.interval - elapsed_time
+            if remaining_time > 0:
+                sleep_duration = 0.1
+                for _ in range(int(remaining_time / sleep_duration)):
+                    if self.stop_requested:
+                        break
+                    time.sleep(sleep_duration)
 
         self.finished.emit()
 
@@ -160,11 +171,12 @@ class DataWorker(QThread):
 from PyQt5.QtCore import QTimer
 
 class MainWindow(QMainWindow):
+    CONFIG_FILE = "config.json"
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("보우메틱 활동량")
         self.setGeometry(300, 300, 500, 500)
-
         self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
 
         icon_path = resource_path("activity.png")
@@ -186,115 +198,11 @@ class MainWindow(QMainWindow):
         self.text_edit = QTextEdit(self)
         self.text_edit.setReadOnly(True)
 
-        # 오전 및 오후 시작/종료 시간 입력 필드 추가
-        self.am_start_label = QLabel("오전 시작 시간:")
-        self.am_start_hour_input = QLineEdit(self)
-        self.am_start_hour_input.setFixedWidth(30)
-        self.am_start_hour_input.setPlaceholderText("시")
+        # 설정 파일에서 기본값 불러오기
+        self.load_config()
 
-        self.am_start_minute_input = QLineEdit(self)
-        self.am_start_minute_input.setFixedWidth(30)
-        self.am_start_minute_input.setPlaceholderText("분")
-
-        # 오전 시작 시간 기본값 6:00
-        self.am_start_hour_input.setText("06")
-        self.am_start_minute_input.setText("00")
-
-        self.am_end_label = QLabel("오전 종료 시간:")
-        self.am_end_hour_input = QLineEdit(self)
-        self.am_end_hour_input.setFixedWidth(30)
-        self.am_end_hour_input.setPlaceholderText("시")
-
-        self.am_end_minute_input = QLineEdit(self)
-        self.am_end_minute_input.setFixedWidth(30)
-        self.am_end_minute_input.setPlaceholderText("분")
-
-        # 오전 종료 시간 기본값 10:00
-        self.am_end_hour_input.setText("10")
-        self.am_end_minute_input.setText("00")
-
-        self.pm_start_label = QLabel("오후 시작 시간:")
-        self.pm_start_hour_input = QLineEdit(self)
-        self.pm_start_hour_input.setFixedWidth(30)
-        self.pm_start_hour_input.setPlaceholderText("시")
-
-        self.pm_start_minute_input = QLineEdit(self)
-        self.pm_start_minute_input.setFixedWidth(30)
-        self.pm_start_minute_input.setPlaceholderText("분")
-
-        # 오후 시작 시간 기본값 15:00
-        self.pm_start_hour_input.setText("15")
-        self.pm_start_minute_input.setText("00")
-
-        self.pm_end_label = QLabel("오후 종료 시간:")
-        self.pm_end_hour_input = QLineEdit(self)
-        self.pm_end_hour_input.setFixedWidth(30)
-        self.pm_end_hour_input.setPlaceholderText("시")
-
-        self.pm_end_minute_input = QLineEdit(self)
-        self.pm_end_minute_input.setFixedWidth(30)
-        self.pm_end_minute_input.setPlaceholderText("분")
-
-        # 오후 종료 시간 기본값 19:00
-        self.pm_end_hour_input.setText("19")
-        self.pm_end_minute_input.setText("00")
-
-        # 한 줄에 배치하기 위해 QHBoxLayout 사용
-        time_layout = QHBoxLayout()
-        time_layout.addWidget(self.am_start_label)
-        time_layout.addWidget(self.am_start_hour_input)
-        time_layout.addWidget(self.am_start_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(self.am_end_label)
-        time_layout.addWidget(self.am_end_hour_input)
-        time_layout.addWidget(self.am_end_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(self.pm_start_label)
-        time_layout.addWidget(self.pm_start_hour_input)
-        time_layout.addWidget(self.pm_start_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(self.pm_end_label)
-        time_layout.addWidget(self.pm_end_hour_input)
-        time_layout.addWidget(self.pm_end_minute_input)
-
-        self.interval_label = QLabel("수집주기 (초):", self)
-        self.interval_input = QLineEdit(self)
-        self.interval_input.setFixedWidth(50)
-        self.interval_input.setText("120")
-
-        self.start_button = QPushButton("데이터 수집 시작", self)
-        self.start_button.setFixedWidth(300)
-        self.start_button.setStyleSheet("color: green;")
-        self.start_button.clicked.connect(self.start_data_collection)
-
-        self.stop_button = QPushButton("데이터 수집 정지", self)
-        self.stop_button.setFixedWidth(300)
-        self.stop_button.setStyleSheet("color: red;")
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self.stop_data_collection)
-
-        controls_layout = QHBoxLayout()
-        controls_layout.addWidget(self.interval_label)
-        controls_layout.addWidget(self.interval_input)
-        controls_layout.addWidget(self.start_button)
-        controls_layout.addWidget(self.stop_button)
-
-        # 문구를 위한 QLabel 추가
-        self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.", self)
-        self.info_label.setStyleSheet("color: red;")  # 스타일을 추가해 강조
-        self.info_label.setFixedHeight(30)  # 라벨 높이 조절 (30픽셀로 고정)
-        self.info_label.setContentsMargins(0, 0, 10, 10)  # 여백 설정 (좌, 상, 우, 하)
-
-        # 기존 레이아웃에 추가
-        layout = QVBoxLayout()
-        layout.addWidget(self.info_label)  # 문구를 상단에 추가
-        layout.addLayout(time_layout)  # 시간을 입력하는 레이아웃을 그 다음에 추가
-        layout.addWidget(self.text_edit)
-        layout.addLayout(controls_layout)
-
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+        # UI 설정
+        self.setup_ui()
 
         self.worker = None
 
@@ -303,8 +211,137 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.check_time_for_auto_start_stop)
         self.timer.start(60000)
 
-        # 프로그램 실행 후 바로 시간 체크를 한 번 호출
-        self.check_time_for_auto_start_stop()  # <-- 이 부분 추가
+        self.check_time_for_auto_start_stop()
+
+    def load_config(self):
+        try:
+            with open("config.json", "r") as file:
+                config = json.load(file)
+                self.am_start_hour = config.get("am_start_hour", "06")
+                self.am_start_minute = config.get("am_start_minute", "00")
+                self.am_end_hour = config.get("am_end_hour", "10")
+                self.am_end_minute = config.get("am_end_minute", "00")
+                self.pm_start_hour = config.get("pm_start_hour", "15")
+                self.pm_start_minute = config.get("pm_start_minute", "00")
+                self.pm_end_hour = config.get("pm_end_hour", "19")
+                self.pm_end_minute = config.get("pm_end_minute", "00")
+                self.interval = config.get("interval", 120)
+        except (FileNotFoundError, json.JSONDecodeError):
+            # 파일이 없거나 JSON 포맷 오류 시 기본값 사용
+            self.am_start_hour = "06"
+            self.am_start_minute = "00"
+            self.am_end_hour = "10"
+            self.am_end_minute = "00"
+            self.pm_start_hour = "15"
+            self.pm_start_minute = "00"
+            self.pm_end_hour = "19"
+            self.pm_end_minute = "00"
+            self.interval = 120
+
+    def save_config(self):
+        config = {
+            "am_start_hour": self.am_start_hour_input.text(),
+            "am_start_minute": self.am_start_minute_input.text(),
+            "am_end_hour": self.am_end_hour_input.text(),
+            "am_end_minute": self.am_end_minute_input.text(),
+            "pm_start_hour": self.pm_start_hour_input.text(),
+            "pm_start_minute": self.pm_start_minute_input.text(),
+            "pm_end_hour": self.pm_end_hour_input.text(),
+            "pm_end_minute": self.pm_end_minute_input.text(),
+            "interval": int(self.interval_input.text())
+        }
+        with open("config.json", "w") as file:
+            json.dump(config, file, indent=4)
+
+    def setup_ui(self):
+        # 오전 및 오후 시작/종료 시간 입력 필드
+        self.am_start_hour_input = QLineEdit(self.am_start_hour)
+        self.am_start_minute_input = QLineEdit(self.am_start_minute)
+        self.am_end_hour_input = QLineEdit(self.am_end_hour)
+        self.am_end_minute_input = QLineEdit(self.am_end_minute)
+        self.pm_start_hour_input = QLineEdit(self.pm_start_hour)
+        self.pm_start_minute_input = QLineEdit(self.pm_start_minute)
+        self.pm_end_hour_input = QLineEdit(self.pm_end_hour)
+        self.pm_end_minute_input = QLineEdit(self.pm_end_minute)
+
+        # 프로그레스바 추가
+        self.progress_bar = QProgressBar(self)
+        self.progress_bar.setValue(0)  # 초기값 설정
+
+        # 레이아웃 설정
+        layout = QVBoxLayout()
+        time_layout = QHBoxLayout()
+
+        # 오전 및 오후 시작/종료 시간 필드 레이아웃 추가
+        time_layout.addWidget(QLabel("오전 시작 시간:"))
+        time_layout.addWidget(self.am_start_hour_input)
+        time_layout.addWidget(self.am_start_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(QLabel("오전 종료 시간:"))
+        time_layout.addWidget(self.am_end_hour_input)
+        time_layout.addWidget(self.am_end_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(QLabel("오후 시작 시간:"))
+        time_layout.addWidget(self.pm_start_hour_input)
+        time_layout.addWidget(self.pm_start_minute_input)
+        time_layout.addSpacing(20)
+        time_layout.addWidget(QLabel("오후 종료 시간:"))
+        time_layout.addWidget(self.pm_end_hour_input)
+        time_layout.addWidget(self.pm_end_minute_input)
+
+        # 수집주기 및 버튼 레이아웃
+        controls_layout = QHBoxLayout()
+        controls_layout.addWidget(QLabel("수집주기 (초):"))
+        self.interval_input = QLineEdit(str(self.interval))  # int 값을 문자열로 변환
+        self.interval_input.setFixedWidth(50)
+        controls_layout.addWidget(self.interval_input)
+
+        # 버튼 스타일 및 기능 설정
+        self.start_button = QPushButton("데이터 수집 시작")
+        self.start_button.setStyleSheet("color: green;")  # 텍스트 색상
+        self.start_button.setFixedWidth(330)
+        self.start_button.clicked.connect(self.start_data_collection)
+        controls_layout.addWidget(self.start_button)
+
+        self.stop_button = QPushButton("데이터 수집 정지")
+        self.stop_button.setStyleSheet("color: red;")  # 텍스트 색상
+        self.stop_button.setFixedWidth(330)
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self.stop_data_collection)
+        controls_layout.addWidget(self.stop_button)
+
+        # 추가 정보 및 문구 표시
+        self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.")
+        self.info_label.setStyleSheet("color: red;")  # 텍스트 색상
+        self.info_label.setFixedHeight(30)
+        self.info_label.setContentsMargins(0, 0, 10, 10)
+
+        layout.addWidget(self.info_label)  # 정보 라벨 추가
+        layout.addLayout(time_layout)
+        layout.addWidget(self.text_edit)
+        layout.addWidget(self.progress_bar)  # 프로그레스바 추가
+        layout.addLayout(controls_layout)
+
+        container = QWidget()
+        container.setLayout(layout)
+        self.setCentralWidget(container)
+
+    # 창을 복원하는 show_window 메서드 추가
+    def closeEvent(self, event):
+        event.ignore()
+        self.hide()
+        self.tray_icon.show()
+
+    def on_tray_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_window()
+
+    def show_window(self):
+        self.show()
+        self.tray_icon.hide()
+
+    def quit_app(self):
+        QApplication.quit()
 
     def check_time_for_auto_start_stop(self):
         current_time = QTime.currentTime()
@@ -355,22 +392,6 @@ class MainWindow(QMainWindow):
             if self.worker and self.worker.isRunning():
                 self.stop_data_collection()
 
-    def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        self.tray_icon.show()
-
-    def on_tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.show_window()
-
-    def show_window(self):
-        self.show()
-        self.tray_icon.hide()
-
-    def quit_app(self):
-        QApplication.quit()
-
     def start_data_collection(self):
         try:
             interval = int(self.interval_input.text())
@@ -380,11 +401,19 @@ class MainWindow(QMainWindow):
             self.append_text("수집 주기는 10초 이상의 양수로 입력해주세요.\n")
             return
 
+        self.save_config()  # 현재 설정을 JSON 파일에 저장
+
+        # 오전 종료 시간과 오후 종료 시간을 QTime으로 변환하여 전달
+        am_end_time = QTime(int(self.am_end_hour_input.text()), int(self.am_end_minute_input.text()))
+        pm_end_time = QTime(int(self.pm_end_hour_input.text()), int(self.pm_end_minute_input.text()))
+
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
+        self.progress_bar.setValue(0)  # 프로그레스바 초기화
 
-        self.worker = DataWorker(interval)
+        self.worker = DataWorker(interval, am_end_time, pm_end_time)
         self.worker.update_text.connect(self.append_text)
+        self.worker.update_progress.connect(self.progress_bar.setValue)  # 프로그레스바 업데이트
         self.worker.finished.connect(self.on_data_collection_finished)
         self.worker.start()
 
@@ -395,6 +424,7 @@ class MainWindow(QMainWindow):
     def on_data_collection_finished(self):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        self.progress_bar.setValue(0)  # 완료 후 프로그레스바 초기화
         self.append_text("-> 데이터 수집이 정지되었습니다.\n")
 
     def append_text(self, text):
