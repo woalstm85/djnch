@@ -22,8 +22,17 @@ def resource_path(relative_path):
         base_path = os.path.abspath(".")
     return os.path.join(base_path, relative_path)
 
+# 로그 파일을 저장할 폴더 경로 설정
+LOG_FOLDER = "logs"
+
+# 로그 폴더 생성
+if not os.path.exists(LOG_FOLDER):
+    os.makedirs(LOG_FOLDER)
+
+# 로그 파일 경로 설정
+log_file_name = os.path.join(LOG_FOLDER, "data_milking.log")
+
 # 로그 파일 설정
-log_file_name = "data_milking.log"
 log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
 log_handler.setFormatter(log_formatter)
@@ -33,7 +42,6 @@ logger.setLevel(logging.INFO)
 logger.addHandler(log_handler)
 
 # PostgreSQL 및 MSSQL 연결 설정
-#pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
 pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
 mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
 pg_engine = create_engine(pg_connection_string)
@@ -44,11 +52,14 @@ class DataWorker(QThread):
     update_progress = pyqtSignal(int)  # 프로그레스바 업데이트 신호 추가
     finished = pyqtSignal()
 
-    def __init__(self, interval, am_end_time, pm_end_time):
+    def __init__(self, interval, am_start_time, am_end_time, pm_start_time, pm_end_time, stop_after_one_run=False):
         super().__init__()
         self.interval = interval
+        self.am_start_time = am_start_time
         self.am_end_time = am_end_time
+        self.pm_start_time = pm_start_time
         self.pm_end_time = pm_end_time
+        self.stop_after_one_run = stop_after_one_run  # 한 번 실행 후 중지 여부
         self.stop_requested = False
         self.mutex = QMutex()
 
@@ -57,32 +68,61 @@ class DataWorker(QThread):
         retry_delay = 10
 
         while not self.stop_requested:
-            # 현재 시간이 설정된 종료 시간을 지났다면 자동으로 멈춤
             current_time = QTime.currentTime()
-            if current_time >= self.am_end_time and current_time < QTime(12, 0):
-                self.update_text.emit("-> 오전 종료 시간에 도달하여 데이터 수집을 중지합니다.\n")
-                break
-            elif current_time >= self.pm_end_time:
-                self.update_text.emit("-> 오후 종료 시간에 도달하여 데이터 수집을 중지합니다.\n")
+
+            # 수집 시간이 아닐 경우에도 실행 가능하며, 한 번 실행 후 중지
+            if self.stop_after_one_run:
+                self.update_text.emit("-> [수동] 데이타 수집 시작] - 한 번만 실행 후 데이터를 수집 중지합니다.\n")
+                self.perform_data_collection()
                 break
 
+            # 수집 시간이 설정된 종료 시간 범위를 초과하면 중지
+            if not (self.am_start_time <= current_time <= self.am_end_time or self.pm_start_time <= current_time <= self.pm_end_time):
+                self.update_text.emit("-> 현재는 수집 시간이 아닙니다. 데이터를 수집하지 않습니다.\n")
+                break
+
+            # 데이터 수집 로직 시작
             start_time = time.time()
-            retries = 0  # 현재 재시도 횟수 초기화
+            retries = 0
 
             while retries < max_retries and not self.stop_requested:
                 try:
-                    start_time_display = datetime.now().strftime('%Y.%m.%d %H:%M:%S')
-                    self.update_text.emit(f"***********************************************\n")
-                    self.update_text.emit(f"-> 데이터 수집 시작 시간 : {start_time_display}\n")
-                    logger.info(f"데이터 수집 시작 시간 : {start_time_display}")
+                    self.perform_data_collection()
+                    break
+                except (OperationalError, TimeoutError, SQLAlchemyError) as e:
+                    retries += 1
+                    self.update_text.emit(f"-> {type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
+                    logger.warning(f"{type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
 
-                    with mssql_engine.connect() as mssql_conn:
-                        max_tstamp = mssql_conn.execute(
-                            text("SELECT ISNULL(MAX(tstamp), CAST('1900-01-01 00:00:00.000000' AS DATETIME2(6)))  FROM ICT_MILKING_ORG_LOG WITH(NOLOCK)")
-                        ).scalar()
+                    if retries < max_retries:
+                        time.sleep(retry_delay)
 
-                    with pg_engine.connect() as pg_conn:
-                        query = text("""
+            # 수집 주기 대기
+            elapsed_time = time.time() - start_time
+            remaining_time = self.interval - elapsed_time
+            if remaining_time > 0:
+                sleep_duration = 0.1
+                for _ in range(int(remaining_time / sleep_duration)):
+                    if self.stop_requested:
+                        break
+                    time.sleep(sleep_duration)
+
+        self.finished.emit()
+
+    def perform_data_collection(self):
+        # 데이터 수집 및 전송 로직 구현
+        start_time_display = datetime.now().strftime('%Y.%m.%d %H:%M:%S')
+        self.update_text.emit(f"***********************************************\n")
+        self.update_text.emit(f"-> 데이터 수집 시작 시간 : {start_time_display}\n")
+        logger.info(f"데이터 수집 시작 시간 : {start_time_display}")
+
+        with mssql_engine.connect() as mssql_conn:
+            max_tstamp = mssql_conn.execute(
+                text("SELECT ISNULL(MAX(tstamp), CAST('1900-01-01 00:00:00.000000' AS DATETIME2(6)))  FROM ICT_MILKING_ORG_LOG WITH(NOLOCK)")
+            ).scalar()
+
+        with pg_engine.connect() as pg_conn:
+            query = text("""
                                     SELECT 
                                         a.milking_id,
                                         to_char(a.tstamp, 'YYYYMMDD') AS YMD,
@@ -117,40 +157,31 @@ class DataWorker(QThread):
                                     WHERE id_tag_number_assigned <> ''
                                       AND a.tstamp > :max_tstamp
                                     ORDER BY a.milkingshift_id, a.tstamp
-                        """)
-                        result = pg_conn.execute(query, {"max_tstamp": max_tstamp})
-                        data = result.fetchall()
+            """)
+            result = pg_conn.execute(query, {"max_tstamp": max_tstamp})
+            data = result.fetchall()
 
-                    pg_row_count = len(data)
-                    pg_duration = time.time() - start_time
-                    self.update_text.emit(f"-> PostgreSQL 데이터 건수: {pg_row_count}건 / {pg_duration:.2f}초\n")
+        if not data:
+            self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
+            return
 
-                    if pg_row_count == 0:
-                        self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
-                    else:
-                        df = pd.DataFrame(data, columns=[
-                            "milking_id", "YMD", "AM_PM", "HMS", "cow_id", "cow_number", "cow_name", "milkingshift_id",
-                            "detacher_address", "id_tag_number_assigned", "milk_weight", "dumped_milk",
-                            "milk_conductivity", "cow_activity", "flow_0_15_sec", "flow_15_30_sec",
-                            "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
-                            "percent_expected_milk", "tstamp_string"
-                        ])
+        self.update_text.emit(f"-> PostgreSQL 데이터 건수: {len(data)}건\n")
 
-                        records = df.to_dict(orient='records')
-                        with mssql_engine.connect() as conn:
-                            postgresql_complete_time = time.time()
-                            transaction_started = False
+        df = pd.DataFrame(data, columns=[
+            "milking_id", "YMD", "AM_PM", "HMS", "cow_id", "cow_number", "cow_name", "milkingshift_id",
+            "detacher_address", "id_tag_number_assigned", "milk_weight", "dumped_milk",
+            "milk_conductivity", "cow_activity", "flow_0_15_sec", "flow_15_30_sec",
+            "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
+            "percent_expected_milk", "tstamp_string"
+        ])
 
-                            try:
-                                for i in range(0, len(records), 500):
-                                    batch = records[i:i + 500]
+        records = df.to_dict(orient='records')
 
-                                    if not transaction_started:
-                                        conn.begin()
-                                        transaction_started = True
-
-                                    for record in batch:
-                                        conn.execute(text("""
+        with mssql_engine.connect() as conn:
+            conn.begin()
+            total_records = len(records)
+            for i, record in enumerate(records, start=1):
+                conn.execute(text("""
                                         EXEC P_ICT_MILKING_ORG_LOG_M 
                                             @milking_id=:milking_id, @ymd=:YMD, @am_pm=:AM_PM, @hms=:HMS, @cow_id=:cow_id, 
                                             @cow_number=:cow_number, @cow_name=:cow_name, @milkingshift_id=:milkingshift_id, 
@@ -162,39 +193,18 @@ class DataWorker(QThread):
                                             @percent_expected_milk=:percent_expected_milk, @tstamp=:tstamp_string
                                         """), record)
 
-                                    progress = int((i + len(batch)) / len(records) * 100)
-                                    self.update_progress.emit(progress)
+                # 프로그레스바 업데이트
+                progress = int((i / total_records) * 100)
+                self.update_progress.emit(progress)
 
-                                conn.commit()
-                            except SQLAlchemyError as e:
-                                if transaction_started:
-                                    conn.rollback()
-                                raise e
+                # GUI 강제 업데이트
+                QApplication.processEvents()
 
-                        mssql_duration = time.time() - postgresql_complete_time
-                        self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
-                        self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
-                        logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
-                    break
+            conn.commit()
 
-                except (OperationalError, TimeoutError, SQLAlchemyError) as e:
-                    retries += 1
-                    self.update_text.emit(f"-> {type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"{type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
 
-                    if retries < max_retries:
-                        time.sleep(retry_delay)
-
-            elapsed_time = time.time() - start_time
-            remaining_time = self.interval - elapsed_time
-            if remaining_time > 0:
-                sleep_duration = 0.1
-                for _ in range(int(remaining_time / sleep_duration)):
-                    if self.stop_requested:
-                        break
-                    time.sleep(sleep_duration)
-
-        self.finished.emit()
+        self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(records)}건\n")
+        self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
 
     def stop(self):
         with QMutexLocker(self.mutex):
@@ -437,15 +447,26 @@ class MainWindow(QMainWindow):
 
         self.save_config()  # 현재 설정을 JSON 파일에 저장
 
-        # 오전 종료 시간과 오후 종료 시간을 QTime으로 변환하여 전달
+        # 오전/오후 시간 범위 가져오기
+        am_start_time = QTime(int(self.am_start_hour_input.text()), int(self.am_start_minute_input.text()))
         am_end_time = QTime(int(self.am_end_hour_input.text()), int(self.am_end_minute_input.text()))
+        pm_start_time = QTime(int(self.pm_start_hour_input.text()), int(self.pm_start_minute_input.text()))
         pm_end_time = QTime(int(self.pm_end_hour_input.text()), int(self.pm_end_minute_input.text()))
+
+        current_time = QTime.currentTime()
+
+        # 자동 중지 여부를 결정하는 플래그
+        stop_after_one_run = False  # 기본은 False
+
+        # 현재 시간이 수집 범위 안에 있는지 확인
+        if not (am_start_time <= current_time <= am_end_time or pm_start_time <= current_time <= pm_end_time):
+            stop_after_one_run = True  # 한 번 실행 후 중지 플래그 설정
 
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.progress_bar.setValue(0)  # 프로그레스바 초기화
 
-        self.worker = DataWorker(interval, am_end_time, pm_end_time)
+        self.worker = DataWorker(interval, am_start_time, am_end_time, pm_start_time, pm_end_time, stop_after_one_run)
         self.worker.update_text.connect(self.append_text)
         self.worker.update_progress.connect(self.progress_bar.setValue)  # 프로그레스바 업데이트
         self.worker.finished.connect(self.on_data_collection_finished)

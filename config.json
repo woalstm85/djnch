@@ -3,9 +3,9 @@
     "am_start_minute": "00",
     "am_end_hour": "10",
     "am_end_minute": "00",
-    "pm_start_hour": "15",
+    "pm_start_hour": "12",
     "pm_start_minute": "00",
     "pm_end_hour": "21",
     "pm_end_minute": "00",
-    "interval": 15
+    "interval": 10
 }
