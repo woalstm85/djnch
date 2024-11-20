@@ -1,482 +1,664 @@
 import sys
-import os
-import pandas as pd
-import logging
 import json
-from logging.handlers import TimedRotatingFileHandler
-import time
-from PyQt5.QtWidgets import QApplication, QMainWindow, QTextEdit, QVBoxLayout, QHBoxLayout, QWidget, QPushButton, \
-    QLabel, QLineEdit, QSystemTrayIcon, QMenu, QAction, QProgressBar
-from PyQt5.QtCore import QThread, pyqtSignal, QMutex, QMutexLocker, Qt
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
+                             QHBoxLayout, QPushButton, QLabel, QLineEdit,
+                             QProgressBar, QTextEdit, QMessageBox, QFrame, QGroupBox,
+                             QSystemTrayIcon, QMenu, QAction)
+from PyQt5.QtCore import QTimer, QTime
 from PyQt5.QtGui import QIcon
+from PyQt5 import QtCore
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError, OperationalError, TimeoutError
-from datetime import datetime
-from PyQt5.QtCore import QTime
 
-# 리소스 파일에 접근할 수 있도록 경로 설정 함수
-def resource_path(relative_path):
-    try:
-        base_path = sys._MEIPASS
-    except Exception:
-        base_path = os.path.abspath(".")
-    return os.path.join(base_path, relative_path)
 
-# 로그 파일 설정
-log_file_name = "data_milking.log"
-log_formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
-log_handler = TimedRotatingFileHandler(log_file_name, when='midnight', interval=1, backupCount=30)
-log_handler.setFormatter(log_formatter)
 
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-logger.addHandler(log_handler)
-
-# PostgreSQL 및 MSSQL 연결 설정
-#pg_connection_string = "postgresql://postgres:1234@localhost:5432/tempdb"
-pg_connection_string = "postgresql://postgres:@localhost:5432/pvnc"
-mssql_connection_string = "mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server"
-pg_engine = create_engine(pg_connection_string)
-mssql_engine = create_engine(mssql_connection_string, fast_executemany=True)
-
-class DataWorker(QThread):
-    update_text = pyqtSignal(str)
-    update_progress = pyqtSignal(int)  # 프로그레스바 업데이트 신호 추가
-    finished = pyqtSignal()
-
-    def __init__(self, interval, am_end_time, pm_end_time):
-        super().__init__()
-        self.interval = interval
-        self.am_end_time = am_end_time
-        self.pm_end_time = pm_end_time
-        self.stop_requested = False
-        self.mutex = QMutex()
-
-    def run(self):
-        max_retries = 3
-        retry_delay = 10
-
-        while not self.stop_requested:
-            # 현재 시간이 설정된 종료 시간을 지났다면 자동으로 멈춤
-            current_time = QTime.currentTime()
-            if current_time >= self.am_end_time and current_time < QTime(12, 0):
-                self.update_text.emit("-> 오전 종료 시간에 도달하여 데이터 수집을 중지합니다.\n")
-                break
-            elif current_time >= self.pm_end_time:
-                self.update_text.emit("-> 오후 종료 시간에 도달하여 데이터 수집을 중지합니다.\n")
-                break
-
-            start_time = time.time()
-            retries = 0  # 현재 재시도 횟수 초기화
-
-            while retries < max_retries and not self.stop_requested:
-                try:
-                    start_time_display = datetime.now().strftime('%Y.%m.%d %H:%M:%S')
-                    self.update_text.emit(f"***********************************************\n")
-                    self.update_text.emit(f"-> 데이터 수집 시작 시간 : {start_time_display}\n")
-                    logger.info(f"데이터 수집 시작 시간 : {start_time_display}")
-
-                    with mssql_engine.connect() as mssql_conn:
-                        max_tstamp = mssql_conn.execute(
-                            text("SELECT ISNULL(MAX(tstamp), CAST('1900-01-01 00:00:00.000000' AS DATETIME2(6)))  FROM ICT_MILKING_ORG_LOG WITH(NOLOCK)")
-                        ).scalar()
-
-                    with pg_engine.connect() as pg_conn:
-                        query = text("""
-                                    SELECT 
-                                        a.milking_id,
-                                        to_char(a.tstamp, 'YYYYMMDD') AS YMD,
-                                        CASE 
-                                            WHEN to_char(a.tstamp, 'HH24MISS') < '120000' THEN '1' 
-                                            ELSE '2' 
-                                        END AS AM_PM,
-                                        to_char(a.tstamp, 'HH24MISS') AS HMS,
-                                        a.cow_id,
-                                        b.cow_number,
-                                        b.cow_name,
-                                        a.milkingshift_id,
-                                        detacher_address,
-                                        id_tag_number_assigned,
-                                        round(CAST(float8 (milk_weight * 0.45359) as numeric), 1) AS milk_weight,
-                                        round(CAST(float8 (dumped_milk * 0.45359) as numeric), 1) AS dumped_milk,
-                                        milk_conductivity,
-                                        cow_activity,
-                                        convertunits(c.flow_0_15_sec) AS flow_0_15_sec,
-                                        convertunits(c.flow_15_30_sec) AS flow_15_30_sec,
-                                        convertunits(c.flow_30_60_sec) AS flow_30_60_sec,
-                                        convertunits(c.flow_60_120_sec) AS flow_60_120_sec,
-                                        c.time_in_low_flow,
-                                        c.reattach_counter,
-                                        c.percent_expected_milk,
-                                        to_char(a.tstamp, 'YYYY-MM-DD HH24:MI:SS.US') AS tstamp_string
-                                    FROM tblmilkings AS a
-                                    LEFT OUTER JOIN public.vewcows AS b 
-                                        ON a.cow_id = b.cow_id
-                                    LEFT OUTER JOIN public.tblstallperformances AS c 
-                                        ON a.milking_id = c.milking_id
-                                    WHERE id_tag_number_assigned <> ''
-                                      AND a.tstamp > :max_tstamp
-                                    ORDER BY a.milkingshift_id, a.tstamp
-                        """)
-                        result = pg_conn.execute(query, {"max_tstamp": max_tstamp})
-                        data = result.fetchall()
-
-                    pg_row_count = len(data)
-                    pg_duration = time.time() - start_time
-                    self.update_text.emit(f"-> PostgreSQL 데이터 건수: {pg_row_count}건 / {pg_duration:.2f}초\n")
-
-                    if pg_row_count == 0:
-                        self.update_text.emit("-> 조회된 데이터가 없습니다. MSSQL에 전송하지 않고 다음 작업을 기다립니다.\n")
-                    else:
-                        df = pd.DataFrame(data, columns=[
-                            "milking_id", "YMD", "AM_PM", "HMS", "cow_id", "cow_number", "cow_name", "milkingshift_id",
-                            "detacher_address", "id_tag_number_assigned", "milk_weight", "dumped_milk",
-                            "milk_conductivity", "cow_activity", "flow_0_15_sec", "flow_15_30_sec",
-                            "flow_30_60_sec", "flow_60_120_sec", "time_in_low_flow", "reattach_counter",
-                            "percent_expected_milk", "tstamp_string"
-                        ])
-
-                        records = df.to_dict(orient='records')
-                        with mssql_engine.connect() as conn:
-                            postgresql_complete_time = time.time()
-                            transaction_started = False
-
-                            try:
-                                for i in range(0, len(records), 500):
-                                    batch = records[i:i + 500]
-
-                                    if not transaction_started:
-                                        conn.begin()
-                                        transaction_started = True
-
-                                    for record in batch:
-                                        conn.execute(text("""
-                                        EXEC P_ICT_MILKING_ORG_LOG_M 
-                                            @milking_id=:milking_id, @ymd=:YMD, @am_pm=:AM_PM, @hms=:HMS, @cow_id=:cow_id, 
-                                            @cow_number=:cow_number, @cow_name=:cow_name, @milkingshift_id=:milkingshift_id, 
-                                            @detacher_address=:detacher_address, @id_tag_number_assigned=:id_tag_number_assigned, 
-                                            @milk_weight=:milk_weight, @dumped_milk=:dumped_milk, @milk_conductivity=:milk_conductivity, 
-                                            @cow_activity=:cow_activity, @flow_0_15_sec=:flow_0_15_sec, @flow_15_30_sec=:flow_15_30_sec, 
-                                            @flow_30_60_sec=:flow_30_60_sec, @flow_60_120_sec=:flow_60_120_sec, 
-                                            @time_in_low_flow=:time_in_low_flow, @reattach_counter=:reattach_counter, 
-                                            @percent_expected_milk=:percent_expected_milk, @tstamp=:tstamp_string
-                                        """), record)
-
-                                    progress = int((i + len(batch)) / len(records) * 100)
-                                    self.update_progress.emit(progress)
-
-                                conn.commit()
-                            except SQLAlchemyError as e:
-                                if transaction_started:
-                                    conn.rollback()
-                                raise e
-
-                        mssql_duration = time.time() - postgresql_complete_time
-                        self.update_text.emit(f"-> MSSQL에 전송된 건수: {len(df)}건 / {mssql_duration:.2f}초\n")
-                        self.update_text.emit(f"-> 데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
-                        logger.info(f"데이터 수집 종료 시간: {datetime.now().strftime('%Y.%m.%d %H:%M:%S')}\n")
-                    break
-
-                except (OperationalError, TimeoutError, SQLAlchemyError) as e:
-                    retries += 1
-                    self.update_text.emit(f"-> {type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...\n")
-                    logger.warning(f"{type(e).__name__} 발생: {str(e)}, {retries}/{max_retries} 재시도 중...")
-
-                    if retries < max_retries:
-                        time.sleep(retry_delay)
-
-            elapsed_time = time.time() - start_time
-            remaining_time = self.interval - elapsed_time
-            if remaining_time > 0:
-                sleep_duration = 0.1
-                for _ in range(int(remaining_time / sleep_duration)):
-                    if self.stop_requested:
-                        break
-                    time.sleep(sleep_duration)
-
-        self.finished.emit()
-
-    def stop(self):
-        with QMutexLocker(self.mutex):
-            self.stop_requested = True
-        self.update_text.emit("-> 중지 요청이 접수되었습니다... 중지 중입니다...\n")
-        logger.info("중지 요청이 접수되었습니다.")
-
-from PyQt5.QtCore import QTimer
-
-class MainWindow(QMainWindow):
-    CONFIG_FILE = "config.json"
-
+class DataCollectorApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("보우메틱 착유량")
-        self.setGeometry(300, 300, 500, 500)
-        self.setWindowFlags(Qt.Window | Qt.WindowMinimizeButtonHint | Qt.WindowCloseButtonHint)
+        self.setWindowTitle('보우메틱 활동량')
+        self.setGeometry(100, 100, 800, 500)  # 높이를 조금 줄임
 
-        icon_path = resource_path("milking.png")
+        # 필수 변수 초기화
+        self.collection_active = False
+        self.auto_mode = True
+        self.manual_stop = False
+        self.is_quitting = False
+
+        # 트레이 아이콘 설정
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon(icon_path))
+        self.tray_icon.setIcon(QIcon('activity.ico'))
 
+        # 초기 툴팁 설정
+        self.update_tray_tooltip()  # 이제 collection_active가 초기화된 후에 호출
+
+        # 트레이 메뉴 설정
         tray_menu = QMenu()
-        restore_action = QAction("복원", self)
-        restore_action.triggered.connect(self.show_window)
-        tray_menu.addAction(restore_action)
 
+        # 창 보이기 액션
+        show_action = QAction("열기", self)
+        show_action.triggered.connect(self.show_window)
+        tray_menu.addAction(show_action)
+
+        # 구분선 추가
+        tray_menu.addSeparator()
+
+        # 종료 액션
         quit_action = QAction("종료", self)
-        quit_action.triggered.connect(self.quit_app)
+        quit_action.triggered.connect(self.quit_application)
         tray_menu.addAction(quit_action)
 
+        # 메뉴를 트레이 아이콘에 설정
         self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self.on_tray_icon_activated)
 
-        self.text_edit = QTextEdit(self)
-        self.text_edit.setReadOnly(True)
+        # 트레이 아이콘 더블클릭 시 창 보이기
+        self.tray_icon.activated.connect(self.tray_icon_activated)
 
-        # 설정 파일에서 기본값 불러오기
+        # 트레이 아이콘 표시
+        self.tray_icon.show()
+
+        # 상태 업데이트
+        self.update_tray_tooltip()
+
+        # 창 닫기 이벤트 처리를 위한 플래그
+
+
+        # 설정 파일 로드를 먼저 수행
+        self.config_file = 'config2.json'
+        self.load_config()
+
+        # 타이머 초기화
+        self.check_timer = QTimer()
+        self.check_timer.timeout.connect(self.check_time_range)
+        self.check_timer.start(1000)  # 1초마다 시간 체크
+
+        self.collection_timer = QTimer()
+        self.collection_timer.timeout.connect(self.collect_data)
+
+        # 데이터베이스 연결 설정
+        self.pg_engine = create_engine("postgresql://postgres:1234@localhost:5432/tempdb")
+        self.ms_engine = create_engine("mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server")
+
+        # 설정 파일 로드
         self.load_config()
 
         # UI 설정
         self.setup_ui()
 
-        self.worker = None
+    def setup_ui(self):
+        main_widget = QWidget()
+        self.setCentralWidget(main_widget)
+        layout = QVBoxLayout(main_widget)
+        layout.setSpacing(10)  # 위젯 간 간격 설정
 
-        # 타이머 설정
-        self.timer = QTimer(self)
-        self.timer.timeout.connect(self.check_time_for_auto_start_stop)
-        self.timer.start(60000)
+        # 시간 설정 그룹박스
+        time_group = QGroupBox("수집 시간 설정")
+        time_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #3F3F3F;
+                margin-top: 6px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                padding: 0 5px;
+            }
+        """)
+        time_layout = QHBoxLayout(time_group)
 
-        self.check_time_for_auto_start_stop()
+        # 오전/오후 시간 입력 스타일
+        time_input_style = """
+            QLineEdit {
+                border: 1px solid #3F3F3F;
+                padding: 3px;
+                background: #ffffff;
+                text-align: center;  /* 텍스트 중앙 정렬 */
+            }
+            QLabel {
+                padding: 0px 5px;
+            }
+        """
+
+        # 오전 시간 프레임
+        morning_frame = QFrame()
+        morning_frame.setFrameStyle(QFrame.Panel | QFrame.Raised)
+        morning_frame.setStyleSheet(time_input_style)
+        # 오전 시간 프레임의 레이아웃 부분 수정
+        morning_layout = QHBoxLayout(morning_frame)
+        morning_layout.setContentsMargins(10, 5, 10, 5)
+        morning_layout.setSpacing(5)  # 위젯 간 간격 설정
+
+        # 레이아웃 정렬을 위해 QLabel 너비 고정
+        morning_start_label = QLabel('오전 시작:')
+        morning_start_label.setFixedWidth(70)
+        morning_layout.addWidget(morning_start_label)
+
+        self.morning_start_hour = QLineEdit(self.config['morning_start']['hour'])
+        self.morning_start_hour.setFixedWidth(40)
+        self.morning_start_hour.setAlignment(QtCore.Qt.AlignCenter)
+        morning_layout.addWidget(self.morning_start_hour)
+        morning_layout.addWidget(QLabel(':'), 1)
+        self.morning_start_min = QLineEdit(self.config['morning_start']['minute'])
+        self.morning_start_min.setFixedWidth(40)
+        self.morning_start_min.setAlignment(QtCore.Qt.AlignCenter)
+        morning_layout.addWidget(self.morning_start_min)
+
+        morning_layout.addSpacing(20)  # 시작과 종료 시간 사이 간격
+
+        morning_end_label = QLabel('오전 종료:')
+        morning_end_label.setFixedWidth(70)
+        morning_layout.addWidget(morning_end_label)
+
+        self.morning_end_hour = QLineEdit(self.config['morning_end']['hour'])
+        self.morning_end_hour.setFixedWidth(40)
+        self.morning_end_hour.setAlignment(QtCore.Qt.AlignCenter)
+        morning_layout.addWidget(self.morning_end_hour)
+        morning_layout.addWidget(QLabel(':'), 1)
+        self.morning_end_min = QLineEdit(self.config['morning_end']['minute'])
+        self.morning_end_min.setFixedWidth(40)
+        self.morning_end_min.setAlignment(QtCore.Qt.AlignCenter)
+        morning_layout.addWidget(self.morning_end_min)
+
+        # 오후 시간 프레임
+        afternoon_frame = QFrame()
+        afternoon_frame.setFrameStyle(QFrame.Panel | QFrame.Raised)
+        afternoon_frame.setStyleSheet(time_input_style)
+        afternoon_layout = QHBoxLayout(afternoon_frame)
+        afternoon_layout.setContentsMargins(10, 5, 10, 5)
+
+        afternoon_layout.addWidget(QLabel('오후 시작:'))
+        self.afternoon_start_hour = QLineEdit(self.config['afternoon_start']['hour'])
+        self.afternoon_start_hour.setFixedWidth(40)
+        self.afternoon_start_hour.setAlignment(QtCore.Qt.AlignCenter)
+        afternoon_layout.addWidget(self.afternoon_start_hour)
+        afternoon_layout.addWidget(QLabel(':'))
+        self.afternoon_start_min = QLineEdit(self.config['afternoon_start']['minute'])
+        self.afternoon_start_min.setFixedWidth(40)
+        self.afternoon_start_min.setAlignment(QtCore.Qt.AlignCenter)
+        afternoon_layout.addWidget(self.afternoon_start_min)
+
+        afternoon_layout.addWidget(QLabel('오후 종료:'))
+        self.afternoon_end_hour = QLineEdit(self.config['afternoon_end']['hour'])
+        self.afternoon_end_hour.setFixedWidth(40)
+        self.afternoon_end_hour.setAlignment(QtCore.Qt.AlignCenter)
+        afternoon_layout.addWidget(self.afternoon_end_hour)
+        afternoon_layout.addWidget(QLabel(':'))
+        self.afternoon_end_min = QLineEdit(self.config['afternoon_end']['minute'])
+        self.afternoon_end_min.setFixedWidth(40)
+        self.afternoon_end_min.setAlignment(QtCore.Qt.AlignCenter)
+        afternoon_layout.addWidget(self.afternoon_end_min)
+
+        time_layout.addWidget(morning_frame)
+        time_layout.addWidget(afternoon_frame)
+        layout.addWidget(time_group)
+
+        # 로그 영역
+        log_group = QGroupBox("수집 상태")
+        log_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                border: 1px solid #3F3F3F;
+                margin-top: 6px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                padding: 0 5px;
+            }            
+        """)
+        log_layout = QVBoxLayout(log_group)
+
+        self.log_text = QTextEdit()
+        self.log_text.setReadOnly(True)
+        self.log_text.setStyleSheet("""
+            QTextEdit {
+                border: 1px solid #3F3F3F;
+                background-color: #ffffff;
+                font-family: Consolas, monospace;
+            }
+        """)
+        log_layout.addWidget(self.log_text)
+
+        # 진행률 바 스타일 설정
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #3F3F3F;
+
+                text-align: center;
+                height: 25px;
+            }
+            QProgressBar::chunk {
+                background-color: #4CAF50;
+            }
+        """)
+        log_layout.addWidget(self.progress_bar)
+
+        layout.addWidget(log_group)
+
+        # 컨트롤 영역
+        control_frame = QFrame()
+        # setup_ui 메서드의 control_frame 스타일시트 부분 수정
+        control_frame.setStyleSheet("""
+            QFrame {
+                border: 1px solid #3F3F3F;
+                background-color: #f5f5f5;
+            }
+            QPushButton {
+                min-width: 100px;
+                min-height: 30px;
+                padding: 5px;
+                border: none;
+                color: white;
+                cursor: pointer;  /* 마우스 커서 변경 */
+            }
+            QPushButton:enabled {
+                background-color: #2196F3;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                cursor: default;  /* 비활성화 시 기본 커서 */
+            }
+            QPushButton:hover:enabled {
+                background-color: #1976D2;
+                cursor: pointer;  /* 호버 시 마우스 커서 */
+            }
+            QLineEdit {
+                border: 1px solid #999999;
+                padding: 3px;
+            }
+        """)
+        control_layout = QHBoxLayout(control_frame)
+        control_layout.setContentsMargins(15, 10, 15, 10)
+
+        # 빈 공간을 먼저 추가하여 나머지 요소들을 오른쪽으로 밀기
+        control_layout.addStretch()
+
+        # 수집주기 설정
+        interval_layout = QHBoxLayout()
+        interval_layout.addWidget(QLabel(' 수집주기 (초) : '))
+        self.interval_input = QLineEdit(self.config['interval'])
+        self.interval_input.setFixedWidth(50)
+        self.interval_input.setFixedHeight(40)
+        self.interval_input.setAlignment(QtCore.Qt.AlignCenter)
+        interval_layout.addWidget(self.interval_input)
+        interval_layout.addSpacing(20)  # 수집주기 input 뒤에 여백 추가
+
+        control_layout.addStretch()  # 왼쪽 빈 공간
+        control_layout.addLayout(interval_layout)  # 수집주기 레이아웃
+
+
+        # 버튼들
+        button_layout = QHBoxLayout()
+        self.start_button = QPushButton('데이터 수집 시작')
+        self.start_button.setStyleSheet("""
+            QPushButton {
+                background-color: #4CAF50;
+                cursor: pointer;
+            }
+            QPushButton:hover:enabled {
+                background-color: #45a049;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                cursor: default;
+            }
+        """)
+        button_layout.addWidget(self.start_button)
+
+        self.stop_button = QPushButton('데이터 수집 정지')
+        self.stop_button.setStyleSheet("""
+            QPushButton {
+                background-color: #f44336;
+                cursor: pointer;
+            }
+            QPushButton:hover:enabled {
+                background-color: #da190b;
+            }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                cursor: default;
+            }
+        """)
+        self.stop_button.setEnabled(False)
+        button_layout.addWidget(self.stop_button)
+
+        self.save_button = QPushButton('설정 저장')
+        self.save_button.setEnabled(False)
+        button_layout.addWidget(self.save_button)
+
+        control_layout.addLayout(interval_layout)
+        control_layout.addLayout(button_layout)
+
+        layout.addWidget(control_frame)
+
+        # 이벤트 연결
+        self.start_button.clicked.connect(self.manual_start_collection)
+        self.stop_button.clicked.connect(self.stop_collection)
+        self.save_button.clicked.connect(self.save_settings)
+
+        # setup_ui 메서드 내의 시간 입력 설정 부분에 다음 내용 추가
+        self.morning_start_hour.textChanged.connect(self.on_setting_changed)
+        self.morning_start_min.textChanged.connect(self.on_setting_changed)
+        self.morning_end_hour.textChanged.connect(self.on_setting_changed)
+        self.morning_end_min.textChanged.connect(self.on_setting_changed)
+        self.afternoon_start_hour.textChanged.connect(self.on_setting_changed)
+        self.afternoon_start_min.textChanged.connect(self.on_setting_changed)
+        self.afternoon_end_hour.textChanged.connect(self.on_setting_changed)
+        self.afternoon_end_min.textChanged.connect(self.on_setting_changed)
+        self.interval_input.textChanged.connect(self.on_setting_changed)
+
+        # setup_ui 메서드의 버튼 생성 부분에 추가
+        from PyQt5.QtCore import Qt
+
+        self.start_button.setCursor(Qt.PointingHandCursor)
+        self.stop_button.setCursor(Qt.PointingHandCursor)
+        self.save_button.setCursor(Qt.PointingHandCursor)
+
+    def on_setting_changed(self):
+        """설정값이 변경되면 호출되는 메서드"""
+        if self.collection_active:
+            QMessageBox.information(self, "설정 변경", "설정이 변경되어 수집이 중지됩니다.\n저장 후 수동으로 다시 시작해주세요.")
+            self.stop_collection()
+
+        # 설정 저장 버튼 활성화
+        self.save_button.setEnabled(True)
+        # 변경사항 저장 전까지 시작 버튼 비활성화
+        self.start_button.setEnabled(False)
+
+    def update_button_states(self):
+        """수집 상태에 따른 버튼 활성화/비활성화 관리"""
+        if self.collection_active:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.save_button.setEnabled(False)  # 수집 중에는 설정 저장 불가
+        else:
+            self.stop_button.setEnabled(False)
+            # 설정이 변경되었다면 시작 버튼 비활성화
+            if self.save_button.isEnabled():
+                self.start_button.setEnabled(False)
+            else:
+                self.start_button.setEnabled(True)
+
+    def log_message(self, message):
+        current_time = QTime.currentTime().toString("HH:mm:ss")
+        self.log_text.append(f"[{current_time}] {message}")
 
     def load_config(self):
         try:
-            with open("config.json", "r") as file:
-                config = json.load(file)
-                self.am_start_hour = config.get("am_start_hour", "06")
-                self.am_start_minute = config.get("am_start_minute", "00")
-                self.am_end_hour = config.get("am_end_hour", "10")
-                self.am_end_minute = config.get("am_end_minute", "00")
-                self.pm_start_hour = config.get("pm_start_hour", "15")
-                self.pm_start_minute = config.get("pm_start_minute", "00")
-                self.pm_end_hour = config.get("pm_end_hour", "19")
-                self.pm_end_minute = config.get("pm_end_minute", "00")
-                self.interval = config.get("interval", 120)
-        except (FileNotFoundError, json.JSONDecodeError):
-            # 파일이 없거나 JSON 포맷 오류 시 기본값 사용
-            self.am_start_hour = "06"
-            self.am_start_minute = "00"
-            self.am_end_hour = "10"
-            self.am_end_minute = "00"
-            self.pm_start_hour = "15"
-            self.pm_start_minute = "00"
-            self.pm_end_hour = "19"
-            self.pm_end_minute = "00"
-            self.interval = 120
+            with open(self.config_file, 'r') as f:
+                self.config = json.load(f)
+        except FileNotFoundError:
+            # 기본 설정
+            self.config = {
+                'morning_start': {'hour': '08', 'minute': '00'},
+                'morning_end': {'hour': '10', 'minute': '00'},
+                'afternoon_start': {'hour': '18', 'minute': '00'},
+                'afternoon_end': {'hour': '21', 'minute': '00'},
+                'interval': '30'
+            }
+            self.save_config()
 
     def save_config(self):
         config = {
-            "am_start_hour": self.am_start_hour_input.text(),
-            "am_start_minute": self.am_start_minute_input.text(),
-            "am_end_hour": self.am_end_hour_input.text(),
-            "am_end_minute": self.am_end_minute_input.text(),
-            "pm_start_hour": self.pm_start_hour_input.text(),
-            "pm_start_minute": self.pm_start_minute_input.text(),
-            "pm_end_hour": self.pm_end_hour_input.text(),
-            "pm_end_minute": self.pm_end_minute_input.text(),
-            "interval": int(self.interval_input.text())
+            'morning_start': {'hour': self.morning_start_hour.text(), 'minute': self.morning_start_min.text()},
+            'morning_end': {'hour': self.morning_end_hour.text(), 'minute': self.morning_end_min.text()},
+            'afternoon_start': {'hour': self.afternoon_start_hour.text(), 'minute': self.afternoon_start_min.text()},
+            'afternoon_end': {'hour': self.afternoon_end_hour.text(), 'minute': self.afternoon_end_min.text()},
+            'interval': self.interval_input.text()
         }
-        with open("config.json", "w") as file:
-            json.dump(config, file, indent=4)
+        with open(self.config_file, 'w') as f:
+            json.dump(config, f, indent=4)
 
-    def setup_ui(self):
-        # 오전 및 오후 시작/종료 시간 입력 필드
-        self.am_start_hour_input = QLineEdit(self.am_start_hour)
-        self.am_start_minute_input = QLineEdit(self.am_start_minute)
-        self.am_end_hour_input = QLineEdit(self.am_end_hour)
-        self.am_end_minute_input = QLineEdit(self.am_end_minute)
-        self.pm_start_hour_input = QLineEdit(self.pm_start_hour)
-        self.pm_start_minute_input = QLineEdit(self.pm_start_minute)
-        self.pm_end_hour_input = QLineEdit(self.pm_end_hour)
-        self.pm_end_minute_input = QLineEdit(self.pm_end_minute)
+    def save_settings(self):
+        """설정 저장 버튼 클릭 시 호출되는 메서드"""
+        try:
+            # 시간 형식 검증
+            for time_input in [self.morning_start_hour, self.morning_end_hour,
+                               self.afternoon_start_hour, self.afternoon_end_hour]:
+                if not (0 <= int(time_input.text()) <= 23):
+                    raise ValueError("시간은 0-23 사이의 값이어야 합니다.")
 
-        # 프로그레스바 추가
-        self.progress_bar = QProgressBar(self)
-        self.progress_bar.setValue(0)  # 초기값 설정
+            for time_input in [self.morning_start_min, self.morning_end_min,
+                               self.afternoon_start_min, self.afternoon_end_min]:
+                if not (0 <= int(time_input.text()) <= 59):
+                    raise ValueError("분은 0-59 사이의 값이어야 합니다.")
 
-        # 레이아웃 설정
-        layout = QVBoxLayout()
-        time_layout = QHBoxLayout()
+            interval = int(self.interval_input.text())
+            if not (1 <= interval <= 3600):
+                raise ValueError("수집 주기는 1-3600초 사이의 값이어야 합니다.")
 
-        # 오전 및 오후 시작/종료 시간 필드 레이아웃 추가
-        time_layout.addWidget(QLabel("오전 시작 시간:"))
-        time_layout.addWidget(self.am_start_hour_input)
-        time_layout.addWidget(self.am_start_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(QLabel("오전 종료 시간:"))
-        time_layout.addWidget(self.am_end_hour_input)
-        time_layout.addWidget(self.am_end_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(QLabel("오후 시작 시간:"))
-        time_layout.addWidget(self.pm_start_hour_input)
-        time_layout.addWidget(self.pm_start_minute_input)
-        time_layout.addSpacing(20)
-        time_layout.addWidget(QLabel("오후 종료 시간:"))
-        time_layout.addWidget(self.pm_end_hour_input)
-        time_layout.addWidget(self.pm_end_minute_input)
+            self.save_config()
+            self.save_button.setEnabled(False)
+            self.start_button.setEnabled(True)  # 저장 완료 후 시작 버튼 활성화
+            self.log_message("설정이 저장되었습니다. 수집을 다시 시작할 수 있습니다.")
+        except ValueError as e:
+            QMessageBox.warning(self, "설정 오류", str(e))
+        except Exception as e:
+            self.log_message(f"설정 저장 중 오류 발생: {str(e)}")
 
-        # 수집주기 및 버튼 레이아웃
-        controls_layout = QHBoxLayout()
-        controls_layout.addWidget(QLabel("수집주기 (초):"))
-        self.interval_input = QLineEdit(str(self.interval))  # int 값을 문자열로 변환
-        self.interval_input.setFixedWidth(50)
-        controls_layout.addWidget(self.interval_input)
+    def check_time_range(self):
+        if not self.manual_stop and self.auto_mode and not self.collection_active:
+            if self.is_within_time_range():
+                self.start_collection()
+        elif self.auto_mode and self.collection_active:
+            if not self.is_within_time_range():
+                self.stop_collection()
 
-        # 버튼 스타일 및 기능 설정
-        self.start_button = QPushButton("데이터 수집 시작")
-        self.start_button.setStyleSheet("color: green;")  # 텍스트 색상
-        self.start_button.setFixedWidth(330)
-        self.start_button.clicked.connect(self.start_data_collection)
-        controls_layout.addWidget(self.start_button)
+    def get_last_activity_id(self):
+        """MSSQL에서 최대 cowactivity_id 조회"""
+        try:
+            with self.ms_engine.connect() as conn:
+                query = text("SELECT ISNULL(MAX(cowactivity_id), 0) as max_id FROM ICT_ACTIVITY_LOG")
+                result = conn.execute(query)
+                max_id = result.scalar()
+                return max_id
+        except Exception as e:
+            self.log_message(f"최대 ID 조회 오류: {str(e)}")
+            raise  # 예외를 다시 발생시켜 상위에서 처리하도록 함
 
-        self.stop_button = QPushButton("데이터 수집 정지")
-        self.stop_button.setStyleSheet("color: red;")  # 텍스트 색상
-        self.stop_button.setFixedWidth(330)
-        self.stop_button.setEnabled(False)
-        self.stop_button.clicked.connect(self.stop_data_collection)
-        controls_layout.addWidget(self.stop_button)
+    def collect_data(self):
+        try:
+            # MSSQL에서 마지막 activity_id 조회
+            try:
+                last_activity_id = self.get_last_activity_id()
+            except Exception:
+                # 이미 get_last_activity_id에서 에러 메시지를 출력했으므로
+                # 여기서는 조용히 처리 종료
+                self.handle_error()
+                return
 
-        # 추가 정보 및 문구 표시
-        self.info_label = QLabel("* 시작/종료 시간 및 수집주기 변경 시 '데이터 수집 정지' 후 변경하세요.")
-        self.info_label.setStyleSheet("color: red;")  # 텍스트 색상
-        self.info_label.setFixedHeight(30)
-        self.info_label.setContentsMargins(0, 0, 10, 10)
+            self.log_message(f"현재 MSSQL 마지막 ID: {last_activity_id}")
 
-        layout.addWidget(self.info_label)  # 정보 라벨 추가
-        layout.addLayout(time_layout)
-        layout.addWidget(self.text_edit)
-        layout.addWidget(self.progress_bar)  # 프로그레스바 추가
-        layout.addLayout(controls_layout)
+            # PostgreSQL에서 데이터 조회
+            query = text("""
+                SELECT a.cowactivity_id, a.cow_id, b.cow_number, b.cow_name,
+                       a.counts, a.counts_perhr, a.cow_activity,
+                       to_char(a.tstamp, 'YYYYMMDD') AS ymd,
+                       to_char(a.tstamp, 'HH24MISS') AS hms
+                FROM tblcowactivities a
+                INNER JOIN tblcows b ON a.cow_id = b.cow_id
+                WHERE a.cowactivity_id > :max_activity_id
+                ORDER BY a.cow_id, cowactivity_id
+            """)
+            try:
+                with self.pg_engine.connect() as conn:
+                    result = conn.execute(query, {"max_activity_id": last_activity_id})
+                    rows = result.fetchall()
 
-        container = QWidget()
-        container.setLayout(layout)
-        self.setCentralWidget(container)
+                    if not rows:
+                        self.log_message("PostgreSQL 신규 데이터 없음")
+                        self.progress_bar.setValue(0)
+                        return
 
-    # 창을 복원하는 show_window 메서드 추가
+                    total_rows = len(rows)
+                    self.log_message(f"PostgreSQL 신규 데이터 조회: {total_rows}건")
+
+                    # MSSQL에 데이터 저장
+                    with self.ms_engine.connect() as ms_conn:
+                        # 트랜잭션 시작
+                        trans = ms_conn.begin()
+                        try:
+                            for i, row in enumerate(rows):
+                                # SP 실행
+                                sp_query = text("""
+                                    EXEC P_ICT_ACTIVITY_LOG_M 
+                                    @cowactivity_id=:cowactivity_id,
+                                    @cow_id=:cow_id,
+                                    @cow_number=:cow_number,
+                                    @cow_name=:cow_name,
+                                    @counts=:counts,
+                                    @counts_perhr=:counts_perhr,
+                                    @cow_activity=:cow_activity,
+                                    @ymd=:ymd,
+                                    @hms=:hms
+                                """)
+
+                                ms_conn.execute(sp_query, {
+                                    "cowactivity_id": row.cowactivity_id,
+                                    "cow_id": row.cow_id,
+                                    "cow_number": row.cow_number,
+                                    "cow_name": row.cow_name,
+                                    "counts": row.counts,
+                                    "counts_perhr": row.counts_perhr,
+                                    "cow_activity": row.cow_activity,
+                                    "ymd": row.ymd,
+                                    "hms": row.hms
+                                })
+
+                                # 진행률 업데이트
+                                progress = int((i + 1) / total_rows * 100)
+                                self.progress_bar.setValue(progress)
+
+                            # 트랜잭션 커밋
+                            trans.commit()
+                            self.log_message(f"MSSQL 데이터 저장 완료: {total_rows}건")
+                        except Exception as e:
+                            trans.rollback()
+                            raise e
+            except Exception as e:
+                self.log_message(f"오류 발생: {str(e)}")
+                self.handle_error()
+                return
+
+        except Exception as e:
+            self.log_message(f"예기치 않은 오류 발생: {str(e)}")
+            self.handle_error()
+            return
+
+    def handle_error(self):
+        """오류 처리를 위한 통합 메서드"""
+        self.progress_bar.setValue(0)
+        if not self.auto_mode:  # 수동 모드일 경우에만 중지
+            self.stop_collection()
+
+    def is_within_time_range(self):
+        current_time = QTime.currentTime()
+
+        # 오전 범위 확인
+        morning_start = QTime(int(self.morning_start_hour.text()),
+                              int(self.morning_start_min.text()))
+        morning_end = QTime(int(self.morning_end_hour.text()),
+                            int(self.morning_end_min.text()))
+
+        # 오후 범위 확인
+        afternoon_start = QTime(int(self.afternoon_start_hour.text()),
+                                int(self.afternoon_start_min.text()))
+        afternoon_end = QTime(int(self.afternoon_end_hour.text()),
+                              int(self.afternoon_end_min.text()))
+
+        return ((morning_start <= current_time <= morning_end) or
+                (afternoon_start <= current_time <= afternoon_end))
+
+    def update_input_states(self, enabled: bool):
+        """입력 필드들의 활성화/비활성화 상태 관리"""
+        # 시간 입력 필드들
+        self.morning_start_hour.setEnabled(enabled)
+        self.morning_start_min.setEnabled(enabled)
+        self.morning_end_hour.setEnabled(enabled)
+        self.morning_end_min.setEnabled(enabled)
+        self.afternoon_start_hour.setEnabled(enabled)
+        self.afternoon_start_min.setEnabled(enabled)
+        self.afternoon_end_hour.setEnabled(enabled)
+        self.afternoon_end_min.setEnabled(enabled)
+        # 수집주기 입력 필드
+        self.interval_input.setEnabled(enabled)
+
+    def start_collection(self):
+        interval = int(self.interval_input.text()) * 1000  # 초를 밀리초로 변환
+        self.collection_timer.start(interval)
+        self.collection_active = True
+        self.update_button_states()
+        # 데이터 수집 시작 시 입력 필드 비활성화
+        self.update_input_states(False)
+        self.update_tray_tooltip()  # 상태 업데이트
+        self.log_message("데이터 수집 시작")
+
+    def stop_collection(self):
+        self.collection_timer.stop()
+        self.collection_active = False
+        self.manual_stop = True
+        self.update_button_states()
+        # 데이터 수집 중지 시 입력 필드 활성화
+        self.update_input_states(True)
+        self.update_tray_tooltip()  # 상태 업데이트
+        self.log_message("데이터 수집 중지")
+
+    def manual_start_collection(self):
+        self.manual_stop = False  # 수동 시작 시 중지 플래그 해제
+        self.auto_mode = False
+        if not self.is_within_time_range():
+            # 범위 외 수동 시작: 1회 수집 후 중지
+            self.collection_active = True  # 상태 변경
+            self.update_button_states()  # 버튼 상태 업데이트
+            self.collect_data()
+            self.stop_collection()
+        else:
+            self.start_collection()
+
     def closeEvent(self, event):
-        event.ignore()
-        self.hide()
-        self.tray_icon.show()
-
-    def on_tray_icon_activated(self, reason):
-        if reason == QSystemTrayIcon.DoubleClick:
-            self.show_window()
+        if not self.is_quitting:
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "보우메틱 활동량",
+                "프로그램이 트레이로 최소화되었습니다.",
+                QSystemTrayIcon.Information,
+                2000
+            )
+        else:
+            event.accept()
 
     def show_window(self):
         self.show()
-        self.tray_icon.hide()
+        self.activateWindow()
 
-    def quit_app(self):
+    def quit_application(self):
+        self.is_quitting = True
+        # 실행 중인 타이머 정지
+        if self.collection_active:
+            self.stop_collection()
+        # 트레이 아이콘 제거
+        self.tray_icon.setVisible(False)
+        # 애플리케이션 종료
         QApplication.quit()
 
-    def check_time_for_auto_start_stop(self):
-        current_time = QTime.currentTime()
+    def tray_icon_activated(self, reason):
+        if reason == QSystemTrayIcon.DoubleClick:
+            self.show_window()
 
-        # 입력된 오전 시작 시간
-        am_start_hour = int(self.am_start_hour_input.text())
-        am_start_minute = int(self.am_start_minute_input.text())
+    # 기존 코드에 추가: 현재 상태 표시를 위한 메서드
+    def update_tray_tooltip(self):
+        if self.collection_active:
+            self.tray_icon.setToolTip("보우메틱 활동량\n데이터 수집 중")
+        else:
+            self.tray_icon.setToolTip("보우메틱 활동량\n대기 중")
 
-        # 입력된 오전 종료 시간
-        am_end_hour = int(self.am_end_hour_input.text())
-        am_end_minute = int(self.am_end_minute_input.text())
-
-        # 입력된 오후 시작 시간
-        pm_start_hour = int(self.pm_start_hour_input.text())
-        pm_start_minute = int(self.pm_start_minute_input.text())
-
-        # 입력된 오후 종료 시간
-        pm_end_hour = int(self.pm_end_hour_input.text())
-        pm_end_minute = int(self.pm_end_minute_input.text())
-
-        # 현재 시간이 오전 시작 시간과 종료 시간 사이일 때만 작업 시작
-        if (current_time.hour() > am_start_hour or (
-                current_time.hour() == am_start_hour and current_time.minute() >= am_start_minute)) and \
-                (current_time.hour() < am_end_hour or (
-                        current_time.hour() == am_end_hour and current_time.minute() < am_end_minute)):
-            # 오전 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
-            if not self.worker or not self.worker.isRunning():
-                self.start_data_collection()
-
-        # 현재 시간이 오후 시작 시간과 종료 시간 사이일 때만 작업 시작
-        elif (current_time.hour() > pm_start_hour or (
-                current_time.hour() == pm_start_hour and current_time.minute() >= pm_start_minute)) and \
-                (current_time.hour() < pm_end_hour or (
-                        current_time.hour() == pm_end_hour and current_time.minute() < pm_end_minute)):
-            # 오후 시작 시간이 이미 지났고, 종료 시간이 지나지 않았다면 시작
-            if not self.worker or not self.worker.isRunning():
-                self.start_data_collection()
-
-        # 현재 시간이 오전 종료 시간을 지났을 경우 멈춤
-        elif current_time.hour() > am_end_hour or (
-                current_time.hour() == am_end_hour and current_time.minute() >= am_end_minute):
-            if self.worker and self.worker.isRunning():
-                self.stop_data_collection()
-
-        # 현재 시간이 오후 종료 시간을 지났을 경우 멈춤
-        elif current_time.hour() > pm_end_hour or (
-                current_time.hour() == pm_end_hour and current_time.minute() >= pm_end_minute):
-            if self.worker and self.worker.isRunning():
-                self.stop_data_collection()
-
-    def start_data_collection(self):
-        try:
-            interval = int(self.interval_input.text())
-            if interval < 10:
-                raise ValueError
-        except ValueError:
-            self.append_text("수집 주기는 10초 이상의 양수로 입력해주세요.\n")
-            return
-
-        self.save_config()  # 현재 설정을 JSON 파일에 저장
-
-        # 오전 종료 시간과 오후 종료 시간을 QTime으로 변환하여 전달
-        am_end_time = QTime(int(self.am_end_hour_input.text()), int(self.am_end_minute_input.text()))
-        pm_end_time = QTime(int(self.pm_end_hour_input.text()), int(self.pm_end_minute_input.text()))
-
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.progress_bar.setValue(0)  # 프로그레스바 초기화
-
-        self.worker = DataWorker(interval, am_end_time, pm_end_time)
-        self.worker.update_text.connect(self.append_text)
-        self.worker.update_progress.connect(self.progress_bar.setValue)  # 프로그레스바 업데이트
-        self.worker.finished.connect(self.on_data_collection_finished)
-        self.worker.start()
-
-    def stop_data_collection(self):
-        if self.worker:
-            self.worker.stop()
-
-    def on_data_collection_finished(self):
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.progress_bar.setValue(0)  # 완료 후 프로그레스바 초기화
-        self.append_text("-> 데이터 수집이 정지되었습니다.\n")
-
-    def append_text(self, text):
-        self.text_edit.append(text)
-        self.text_edit.ensureCursorVisible()
-
-        max_lines = 500
-        if self.text_edit.document().blockCount() > max_lines:
-            cursor = self.text_edit.textCursor()
-            cursor.movePosition(cursor.Start)
-            cursor.select(cursor.BlockUnderCursor)
-            cursor.removeSelectedText()
-            cursor.deleteChar()
-
-if __name__ == "__main__":
+def main():
     app = QApplication(sys.argv)
-    icon_path = resource_path("milking.png")
-    app.setWindowIcon(QIcon(icon_path))
-    window = MainWindow()
+    window = DataCollectorApp()
     window.show()
     sys.exit(app.exec_())
+
+
+if __name__ == '__main__':
+    main()

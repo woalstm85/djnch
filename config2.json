@@ -1,0 +1,19 @@
+{
+    "morning_start": {
+        "hour": "06",
+        "minute": "00"
+    },
+    "morning_end": {
+        "hour": "11",
+        "minute": "00"
+    },
+    "afternoon_start": {
+        "hour": "20",
+        "minute": "00"
+    },
+    "afternoon_end": {
+        "hour": "23",
+        "minute": "00"
+    },
+    "interval": "10"
+}
