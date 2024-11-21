@@ -1,21 +1,28 @@
 import sys
+import os
+import logging
 import json
+import psutil
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QPushButton, QLabel, QLineEdit,
                              QProgressBar, QTextEdit, QMessageBox, QFrame, QGroupBox,
                              QSystemTrayIcon, QMenu, QAction)
 from PyQt5.QtCore import QTimer, QTime
-from PyQt5.QtGui import QIcon
+from PyQt5.QtGui import QIcon, QIntValidator
 from PyQt5 import QtCore
 from sqlalchemy import create_engine, text
-
-
+from datetime import datetime, timedelta
 
 class DataCollectorApp(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle('보우메틱 활동량')
-        self.setGeometry(100, 100, 800, 500)  # 높이를 조금 줄임
+        self.setGeometry(100, 100, 800, 700)  # 높이를 조금 줄임
+
+        self.setWindowIcon(QIcon('activity.ico'))  # 타이틀바 아이콘 설정
+
+        # 메뉴바 추가
+        self.create_menu_bar()
 
         # 필수 변수 초기화
         self.collection_active = False
@@ -80,8 +87,111 @@ class DataCollectorApp(QMainWindow):
         # 설정 파일 로드
         self.load_config()
 
+        # 로깅 설정
+        self.setup_logger()
+        self.current_log_date = datetime.now().date()
+
         # UI 설정
         self.setup_ui()
+
+    def setup_logger(self):
+        """로거 설정"""
+        # logs 디렉토리 생성
+        if not os.path.exists('logs'):
+            os.makedirs('logs')
+
+        # 현재 날짜로 로그 파일명 생성
+        log_file = os.path.join('logs', f'activity_{datetime.now().strftime("%Y%m%d")}.log')
+
+        # 로거 설정
+        self.logger = logging.getLogger('ActivityLogger')
+        self.logger.setLevel(logging.INFO)
+
+        # 핸들러 설정
+        handler = logging.FileHandler(log_file, encoding='utf-8')
+        handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(levelname)s] - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        ))
+
+        # 기존 핸들러 제거 후 새로운 핸들러 추가
+        self.logger.handlers.clear()
+        self.logger.addHandler(handler)
+
+    def check_log_date(self):
+        #날짜가 변경되었는지 확인하고 필요시 로거 재설정
+        current_date = datetime.now().date()
+        if current_date != self.current_log_date:
+            self.current_log_date = current_date
+            self.setup_logger()
+            # 날짜가 변경될 때 오래된 로그 정리
+            self.cleanup_old_logs()
+
+    def cleanup_old_logs(self):
+        #10일 이상 지난 로그 파일 삭제
+        try:
+            # 오늘 날짜 계산
+            today = datetime.now()
+            cutoff_date = today - timedelta(days=10)
+
+            # logs 디렉토리 내의 파일 검사
+            log_dir = 'logs'
+            if os.path.exists(log_dir):
+                for filename in os.listdir(log_dir):
+                    if filename.startswith('activity_') and filename.endswith('.log'):
+                        try:
+                            # 파일명에서 날짜 추출 (activity_20241121.log -> 20241121)
+                            file_date_str = filename.replace('activity_', '').replace('.log', '')
+                            file_date = datetime.strptime(file_date_str, '%Y%m%d')
+
+                            # 10일 이상 지난 파일 삭제
+                            if file_date.date() < cutoff_date.date():
+                                file_path = os.path.join(log_dir, filename)
+                                os.remove(file_path)
+                                print(f"Removed old log file: {filename}")  # 디버깅용
+                        except ValueError:
+                            # 파일명 형식이 잘못된 경우 무시
+                            continue
+        except Exception as e:
+            print(f"Log cleanup error: {str(e)}")  # 디버깅용
+
+    def create_menu_bar(self):
+        """메뉴바 생성"""
+        menubar = self.menuBar()
+        menubar.setStyleSheet("""
+            QMenuBar {
+                background-color: #f5f5f5;
+                border-bottom: 1px solid #3F3F3F;
+            }
+            QMenuBar::item {
+                padding: 4px 10px;
+                background-color: transparent;
+            }
+            QMenuBar::item:selected {
+                background-color: #e0e0e0;
+            }
+            QMenu {
+                background-color: #ffffff;
+                border: 1px solid #3F3F3F;
+            }
+            QMenu::item {
+                padding: 4px 20px;
+            }
+            QMenu::item:selected {
+                background-color: #e0e0e0;
+            }
+        """)
+
+        # 파일 메뉴
+        file_menu = menubar.addMenu('파일')
+
+        # 종료 액션
+        exit_action = QAction('종료', self)
+        exit_action.setStatusTip('프로그램 종료')
+        exit_action.triggered.connect(self.quit_application)
+
+        # 메뉴에 액션 추가
+        file_menu.addAction(exit_action)
 
     def setup_ui(self):
         main_widget = QWidget()
@@ -118,6 +228,11 @@ class DataCollectorApp(QMainWindow):
             }
         """
 
+        # QLineEdit에 입력 제한 추가
+        validator_hour = QIntValidator(0, 23)  # 시간은 0-23
+        validator_min = QIntValidator(0, 59)  # 분은 0-59
+        validator_interval = QIntValidator(1, 3600)  # 수집주기는 1-3600
+
         # 오전 시간 프레임
         morning_frame = QFrame()
         morning_frame.setFrameStyle(QFrame.Panel | QFrame.Raised)
@@ -137,6 +252,7 @@ class DataCollectorApp(QMainWindow):
         self.morning_start_hour.setAlignment(QtCore.Qt.AlignCenter)
         morning_layout.addWidget(self.morning_start_hour)
         morning_layout.addWidget(QLabel(':'), 1)
+
         self.morning_start_min = QLineEdit(self.config['morning_start']['minute'])
         self.morning_start_min.setFixedWidth(40)
         self.morning_start_min.setAlignment(QtCore.Qt.AlignCenter)
@@ -286,6 +402,19 @@ class DataCollectorApp(QMainWindow):
         control_layout.addStretch()  # 왼쪽 빈 공간
         control_layout.addLayout(interval_layout)  # 수집주기 레이아웃
 
+        # 시간 입력 제한
+        self.morning_start_hour.setValidator(validator_hour)
+        self.morning_start_min.setValidator(validator_min)
+        self.morning_end_hour.setValidator(validator_hour)
+        self.morning_end_min.setValidator(validator_min)
+        self.afternoon_start_hour.setValidator(validator_hour)
+        self.afternoon_start_min.setValidator(validator_min)
+        self.afternoon_end_hour.setValidator(validator_hour)
+        self.afternoon_end_min.setValidator(validator_min)
+
+        # 수집주기 입력 제한
+        self.interval_input.setValidator(validator_interval)
+
 
         # 버튼들
         button_layout = QHBoxLayout()
@@ -354,6 +483,52 @@ class DataCollectorApp(QMainWindow):
         self.stop_button.setCursor(Qt.PointingHandCursor)
         self.save_button.setCursor(Qt.PointingHandCursor)
 
+        # 상태바 설정
+        self.statusBar = self.statusBar()
+        self.statusBar.setStyleSheet("""
+            QStatusBar {
+                border-top: 1px solid #3F3F3F;
+                background: #f5f5f5;
+            }
+        """)
+
+        # 상태바 레이블 생성
+        self.memory_label = QLabel()
+        self.time_label = QLabel()
+        self.status_label = QLabel()
+
+        # 상태바에 위젯 추가
+        self.statusBar.addPermanentWidget(self.status_label)
+        self.statusBar.addPermanentWidget(self.memory_label)
+        self.statusBar.addPermanentWidget(self.time_label)
+
+        # 상태바 업데이트 타이머
+        self.status_timer = QTimer()
+        self.status_timer.timeout.connect(self.update_status_bar)
+        self.status_timer.start(1000)  # 1초마다 업데이트
+
+    def update_status_bar(self):
+        """상태바 정보 업데이트"""
+        try:
+            # 메모리 사용량
+            process = psutil.Process()
+            memory_info = process.memory_info()
+            memory_usage = memory_info.rss / 1024 / 1024  # MB 단위로 변환
+            self.memory_label.setText(f"메모리 사용량: {memory_usage:.1f} MB | ")
+
+            # 현재 시간
+            current_time = QTime.currentTime().toString("HH:mm:ss")
+            self.time_label.setText(f"현재 시간: {current_time}")
+
+            # 현재 상태
+            if self.collection_active:
+                self.status_label.setText("상태: 데이터 수집 중 | ")
+            else:
+                self.status_label.setText("상태: 대기 중 | ")
+
+        except Exception as e:
+            print(f"상태바 업데이트 오류: {str(e)}")
+
     def on_setting_changed(self):
         """설정값이 변경되면 호출되는 메서드"""
         if self.collection_active:
@@ -380,8 +555,22 @@ class DataCollectorApp(QMainWindow):
                 self.start_button.setEnabled(True)
 
     def log_message(self, message):
+        #로그 메시지 추가 및 최신 500줄 유지
         current_time = QTime.currentTime().toString("HH:mm:ss")
         self.log_text.append(f"[{current_time}] {message}")
+
+        # 로그 라인 수 체크
+        doc = self.log_text.document()
+        if doc.lineCount() > 20:
+            # 커서를 처음으로 이동
+            cursor = self.log_text.textCursor()
+            cursor.movePosition(cursor.Start)
+            # 첫 줄 선택
+            cursor.movePosition(cursor.Down, cursor.KeepAnchor,
+                                doc.lineCount() - 20)
+            # 선택된 텍스트 삭제 (오래된 로그 제거)
+            cursor.removeSelectedText()
+            cursor.removeSelectedText()  # 남은 빈 줄 제거
 
     def load_config(self):
         try:
@@ -457,17 +646,20 @@ class DataCollectorApp(QMainWindow):
             raise  # 예외를 다시 발생시켜 상위에서 처리하도록 함
 
     def collect_data(self):
+        # 날짜 체크 및 로거 업데이트
+        self.check_log_date()
+
         try:
             # MSSQL에서 마지막 activity_id 조회
             try:
                 last_activity_id = self.get_last_activity_id()
-            except Exception:
-                # 이미 get_last_activity_id에서 에러 메시지를 출력했으므로
-                # 여기서는 조용히 처리 종료
+                msg = f"현재 MSSQL 마지막 ID: {last_activity_id}"
+                self.log_message(msg)
+            except Exception as e:
+                error_msg = f"최대 ID 조회 오류: {str(e)}"
+                self.log_message(error_msg)
                 self.handle_error()
                 return
-
-            self.log_message(f"현재 MSSQL 마지막 ID: {last_activity_id}")
 
             # PostgreSQL에서 데이터 조회
             query = text("""
@@ -480,18 +672,22 @@ class DataCollectorApp(QMainWindow):
                 WHERE a.cowactivity_id > :max_activity_id
                 ORDER BY a.cow_id, cowactivity_id
             """)
+
             try:
                 with self.pg_engine.connect() as conn:
                     result = conn.execute(query, {"max_activity_id": last_activity_id})
                     rows = result.fetchall()
 
                     if not rows:
-                        self.log_message("PostgreSQL 신규 데이터 없음")
+                        msg = "PostgreSQL 신규 데이터 없음"
+                        self.log_message(msg)
                         self.progress_bar.setValue(0)
                         return
 
                     total_rows = len(rows)
-                    self.log_message(f"PostgreSQL 신규 데이터 조회: {total_rows}건")
+                    msg = f"PostgreSQL 신규 데이터 조회: {total_rows}건"
+                    self.log_message(msg)
+                    self.logger.info(msg)
 
                     # MSSQL에 데이터 저장
                     with self.ms_engine.connect() as ms_conn:
@@ -531,17 +727,28 @@ class DataCollectorApp(QMainWindow):
 
                             # 트랜잭션 커밋
                             trans.commit()
-                            self.log_message(f"MSSQL 데이터 저장 완료: {total_rows}건")
+                            msg = f"MSSQL 데이터 저장 완료: {total_rows}건\n{'*' * 40}"
+                            self.log_message(msg)
+                            self.logger.info(msg)
+
                         except Exception as e:
                             trans.rollback()
+                            error_msg = f"MSSQL 데이터 저장 실패: {str(e)}"
+                            self.log_message(error_msg)
+                            self.logger.error(error_msg)
                             raise e
+
             except Exception as e:
-                self.log_message(f"오류 발생: {str(e)}")
+                error_msg = f"데이터베이스 처리 오류: {str(e)}"
+                self.log_message(error_msg)
+                self.logger.error(error_msg)
                 self.handle_error()
                 return
 
         except Exception as e:
-            self.log_message(f"예기치 않은 오류 발생: {str(e)}")
+            error_msg = f"예기치 않은 오류 발생: {str(e)}"
+            self.log_message(error_msg)
+            self.logger.error(error_msg)
             self.handle_error()
             return
 
@@ -594,14 +801,27 @@ class DataCollectorApp(QMainWindow):
         self.log_message("데이터 수집 시작")
 
     def stop_collection(self):
-        self.collection_timer.stop()
-        self.collection_active = False
-        self.manual_stop = True
-        self.update_button_states()
-        # 데이터 수집 중지 시 입력 필드 활성화
-        self.update_input_states(True)
-        self.update_tray_tooltip()  # 상태 업데이트
-        self.log_message("데이터 수집 중지")
+        """데이터 수집 중지"""
+        try:
+            self.collection_timer.stop()
+            self.collection_active = False
+            self.manual_stop = True
+
+            # 진행 중인 DB 트랜잭션이 있다면 롤백
+            try:
+                if hasattr(self, 'current_transaction'):
+                    self.current_transaction.rollback()
+            except:
+                pass
+
+            self.update_button_states()
+            self.update_input_states(True)
+            self.update_tray_tooltip()
+            self.log_message("데이터 수집이 중지되었습니다.")
+
+        except Exception as e:
+            self.log_message(f"수집 중지 중 오류 발생: {str(e)}")
+            self.logger.error(f"수집 중지 중 오류 발생: {str(e)}")
 
     def manual_start_collection(self):
         self.manual_stop = False  # 수동 시작 시 중지 플래그 해제
@@ -633,14 +853,90 @@ class DataCollectorApp(QMainWindow):
         self.activateWindow()
 
     def quit_application(self):
-        self.is_quitting = True
-        # 실행 중인 타이머 정지
         if self.collection_active:
-            self.stop_collection()
-        # 트레이 아이콘 제거
-        self.tray_icon.setVisible(False)
-        # 애플리케이션 종료
-        QApplication.quit()
+            reply = QMessageBox.question(
+                self,
+                '종료 확인',
+                "데이터 수집이 진행 중입니다.\n안전하게 중지하고 종료하시겠습니까?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+
+            if reply == QMessageBox.Yes:
+                try:
+                    # 진행 중인 작업 안전하게 중지
+                    self.log_message("프로그램 종료 요청 - 데이터 수집 중지 중...")
+                    self.logger.info("프로그램 종료 요청 - 데이터 수집 중지 시작")
+
+                    # 수집 중지
+                    self.stop_collection()
+
+                    # DB 연결 정리
+                    if hasattr(self, 'pg_engine'):
+                        self.pg_engine.dispose()
+                    if hasattr(self, 'ms_engine'):
+                        self.ms_engine.dispose()
+
+                    self.log_message("모든 작업이 안전하게 중지되었습니다.")
+                    self.logger.info("프로그램 정상 종료")
+
+                    # 종료 처리
+                    self.is_quitting = True
+                    self.tray_icon.setVisible(False)
+                    QApplication.quit()
+                except Exception as e:
+                    QMessageBox.critical(
+                        self,
+                        '오류',
+                        f"종료 처리 중 오류가 발생했습니다:\n{str(e)}\n강제 종료됩니다.",
+                        QMessageBox.Ok
+                    )
+                    self.is_quitting = True
+                    self.tray_icon.setVisible(False)
+                    QApplication.quit()
+            else:
+                # 사용자가 종료를 취소함
+                return
+        else:
+            # 수집이 진행 중이 아닐 때는 바로 종료
+            self.is_quitting = True
+            self.tray_icon.setVisible(False)
+            QApplication.quit()
+
+    def closeEvent(self, event):
+        """윈도우 X 버튼 클릭 시 호출되는 이벤트"""
+        if not self.is_quitting:
+            if self.collection_active:
+                reply = QMessageBox.question(
+                    self,
+                    '최소화 확인',
+                    "데이터 수집이 진행 중입니다.\n트레이로 최소화하시겠습니까?\n\n(종료하시려면 '파일 > 종료' 메뉴를 사용해주세요)",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.Yes
+                )
+
+                if reply == QMessageBox.Yes:
+                    event.ignore()
+                    self.hide()
+                    self.tray_icon.showMessage(
+                        "보우메틱 활동량",
+                        "프로그램이 트레이로 최소화되었습니다.\n데이터 수집은 계속 진행됩니다.",
+                        QSystemTrayIcon.Information,
+                        2000
+                    )
+                else:
+                    event.ignore()
+            else:
+                event.ignore()
+                self.hide()
+                self.tray_icon.showMessage(
+                    "보우메틱 활동량",
+                    "프로그램이 트레이로 최소화되었습니다.",
+                    QSystemTrayIcon.Information,
+                    2000
+                )
+        else:
+            event.accept()
 
     def tray_icon_activated(self, reason):
         if reason == QSystemTrayIcon.DoubleClick:
@@ -655,6 +951,7 @@ class DataCollectorApp(QMainWindow):
 
 def main():
     app = QApplication(sys.argv)
+    app.setWindowIcon(QIcon('activity.ico'))  # 애플리케이션 전체 아이콘 설정
     window = DataCollectorApp()
     window.show()
     sys.exit(app.exec_())
