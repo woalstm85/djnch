@@ -16,10 +16,10 @@ from datetime import datetime, timedelta
 class DataCollectorApp(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('보우메틱 활동량')
+        self.setWindowTitle('보우메틱 착유량')
         self.setGeometry(100, 100, 800, 700)  # 높이를 조금 줄임
 
-        self.setWindowIcon(QIcon('activity.ico'))  # 타이틀바 아이콘 설정
+        self.setWindowIcon(QIcon('milking.ico'))  # 타이틀바 아이콘 설정
 
         # 메뉴바 추가
         self.create_menu_bar()
@@ -32,7 +32,7 @@ class DataCollectorApp(QMainWindow):
 
         # 트레이 아이콘 설정
         self.tray_icon = QSystemTrayIcon(self)
-        self.tray_icon.setIcon(QIcon('activity.ico'))
+        self.tray_icon.setIcon(QIcon('milking.ico'))
 
         # 초기 툴팁 설정
         self.update_tray_tooltip()  # 이제 collection_active가 초기화된 후에 호출
@@ -69,7 +69,7 @@ class DataCollectorApp(QMainWindow):
 
 
         # 설정 파일 로드를 먼저 수행
-        self.config_file = 'config2.json'
+        self.config_file = 'config.json'
         self.load_config()
 
         # 타이머 초기화
@@ -82,6 +82,7 @@ class DataCollectorApp(QMainWindow):
 
         # 데이터베이스 연결 설정
         self.pg_engine = create_engine("postgresql://postgres:1234@localhost:5432/tempdb")
+        # self.pg_engine = create_engine("postgresql://postgres:@localhost:5432/pvnc")
         self.ms_engine = create_engine("mssql+pyodbc://sa:ghltktjqj7%29@221.139.49.70:2433/DJNCH?driver=SQL+Server")
 
         # 설정 파일 로드
@@ -101,10 +102,10 @@ class DataCollectorApp(QMainWindow):
             os.makedirs('logs')
 
         # 현재 날짜로 로그 파일명 생성
-        log_file = os.path.join('logs', f'activity_{datetime.now().strftime("%Y%m%d")}.log')
+        log_file = os.path.join('logs', f'milking_{datetime.now().strftime("%Y%m%d")}.log')
 
         # 로거 설정
-        self.logger = logging.getLogger('ActivityLogger')
+        self.logger = logging.getLogger('MilkingLogger')
         self.logger.setLevel(logging.INFO)
 
         # 핸들러 설정
@@ -138,10 +139,10 @@ class DataCollectorApp(QMainWindow):
             log_dir = 'logs'
             if os.path.exists(log_dir):
                 for filename in os.listdir(log_dir):
-                    if filename.startswith('activity_') and filename.endswith('.log'):
+                    if filename.startswith('milking_') and filename.endswith('.log'):
                         try:
-                            # 파일명에서 날짜 추출 (activity_20241121.log -> 20241121)
-                            file_date_str = filename.replace('activity_', '').replace('.log', '')
+                            # 파일명에서 날짜 추출 (milking_20241121.log -> 20241121)
+                            file_date_str = filename.replace('milking_', '').replace('.log', '')
                             file_date = datetime.strptime(file_date_str, '%Y%m%d')
 
                             # 10일 이상 지난 파일 삭제
@@ -192,6 +193,21 @@ class DataCollectorApp(QMainWindow):
 
         # 메뉴에 액션 추가
         file_menu.addAction(exit_action)
+
+    def check_interval_setting(self):
+        """수집 주기 설정값 변경 체크"""
+        new_interval = self.get_collection_interval()
+        if new_interval != self.current_interval:
+            self.log_message(f"수집 주기가 변경되었습니다: {self.current_interval}초 -> {new_interval}초")
+            self.current_interval = new_interval
+
+            # 수집 중이면 타이머 재시작
+            if self.collection_active:
+                self.collection_timer.stop()
+                self.collection_timer.start(self.current_interval * 1000)
+
+            # UI 업데이트
+            self.interval_input.setText(str(self.current_interval))
 
     def setup_ui(self):
         main_widget = QWidget()
@@ -392,15 +408,25 @@ class DataCollectorApp(QMainWindow):
         # 수집주기 설정
         interval_layout = QHBoxLayout()
         interval_layout.addWidget(QLabel(' 수집주기 (초) : '))
-        self.interval_input = QLineEdit(self.config['interval'])
-        self.interval_input.setFixedWidth(50)
+
+
+        # 수집주기 입력필드 생성 및 설정
+        initial_interval = self.get_collection_interval()  # DB에서 초기값 가져오기
+        self.interval_input = QLineEdit(str(initial_interval))
+        self.interval_input.setFixedWidth(100)
         self.interval_input.setFixedHeight(40)
         self.interval_input.setAlignment(QtCore.Qt.AlignCenter)
+        self.interval_input.setReadOnly(True)  # 읽기 전용으로 설정
         interval_layout.addWidget(self.interval_input)
         interval_layout.addSpacing(20)  # 수집주기 input 뒤에 여백 추가
 
-        control_layout.addStretch()  # 왼쪽 빈 공간
-        control_layout.addLayout(interval_layout)  # 수집주기 레이아웃
+        # 수집주기 체크 타이머 설정
+        self.interval_check_timer = QTimer()
+        self.interval_check_timer.timeout.connect(self.check_db_interval)
+        self.interval_check_timer.start(5000)  # 5초마다 체크
+
+        # 현재 적용된 수집 주기 저장
+        self.current_interval = initial_interval
 
         # 시간 입력 제한
         self.morning_start_hour.setValidator(validator_hour)
@@ -507,6 +533,27 @@ class DataCollectorApp(QMainWindow):
         self.status_timer.timeout.connect(self.update_status_bar)
         self.status_timer.start(1000)  # 1초마다 업데이트
 
+    def check_db_interval(self):
+        """DB의 수집주기 설정값 확인 및 업데이트"""
+        try:
+            new_interval = self.get_collection_interval()
+            current_interval = int(self.interval_input.text())
+
+            if new_interval != current_interval:
+                # 자동 업데이트 플래그 설정
+                self.interval_input.blockSignals(True)  # 시그널 임시 차단
+                self.interval_input.setText(str(new_interval))
+                self.interval_input.blockSignals(False)  # 시그널 복원
+
+                if self.collection_active:
+                    self.collection_timer.stop()
+                    self.collection_timer.start(new_interval * 1000)
+
+                self.log_message(f"수집주기가 {current_interval}초에서 {new_interval}초로 변경되었습니다.")
+
+        except Exception as e:
+            self.log_message(f"수집주기 확인 중 오류 발생: {str(e)}")
+
     def update_status_bar(self):
         """상태바 정보 업데이트"""
         try:
@@ -577,13 +624,12 @@ class DataCollectorApp(QMainWindow):
             with open(self.config_file, 'r') as f:
                 self.config = json.load(f)
         except FileNotFoundError:
-            # 기본 설정
+            # 기본 설정 (interval 제외)
             self.config = {
-                'morning_start': {'hour': '08', 'minute': '00'},
+                'morning_start': {'hour': '06', 'minute': '00'},
                 'morning_end': {'hour': '10', 'minute': '00'},
-                'afternoon_start': {'hour': '18', 'minute': '00'},
-                'afternoon_end': {'hour': '21', 'minute': '00'},
-                'interval': '30'
+                'afternoon_start': {'hour': '15', 'minute': '00'},
+                'afternoon_end': {'hour': '19', 'minute': '00'}
             }
             self.save_config()
 
@@ -592,11 +638,29 @@ class DataCollectorApp(QMainWindow):
             'morning_start': {'hour': self.morning_start_hour.text(), 'minute': self.morning_start_min.text()},
             'morning_end': {'hour': self.morning_end_hour.text(), 'minute': self.morning_end_min.text()},
             'afternoon_start': {'hour': self.afternoon_start_hour.text(), 'minute': self.afternoon_start_min.text()},
-            'afternoon_end': {'hour': self.afternoon_end_hour.text(), 'minute': self.afternoon_end_min.text()},
-            'interval': self.interval_input.text()
+            'afternoon_end': {'hour': self.afternoon_end_hour.text(), 'minute': self.afternoon_end_min.text()}
         }
         with open(self.config_file, 'w') as f:
             json.dump(config, f, indent=4)
+
+    def get_collection_interval(self):
+        """MSSQL에서 수집 주기 값을 조회"""
+        try:
+            with self.ms_engine.connect() as conn:
+                query = text("""
+                    SELECT ETC_TEXT1 AS TIM
+                    FROM CODE_INFO_DTL
+                    WHERE SYS_KIND = 'CONTROL'
+                    AND CODE_KIND = 'SYS142'
+                """)
+                result = conn.execute(query)
+                interval = result.scalar()
+                if interval:
+                    return int(interval)
+                return 1800  # 기본값
+        except Exception as e:
+            self.log_message(f"수집 주기 조회 오류: {str(e)}")
+            return 1800  # 오류 시 기본값
 
     def save_settings(self):
         """설정 저장 버튼 클릭 시 호출되는 메서드"""
@@ -626,21 +690,22 @@ class DataCollectorApp(QMainWindow):
             self.log_message(f"설정 저장 중 오류 발생: {str(e)}")
 
     def check_time_range(self):
-        if not self.manual_stop and self.auto_mode and not self.collection_active:
+        if not self.manual_stop and self.auto_mode:  # collection_active 체크 제거
             if self.is_within_time_range():
-                self.start_collection()
-        elif self.auto_mode and self.collection_active:
-            if not self.is_within_time_range():
-                self.stop_collection()
+                if not self.collection_active:  # 수집이 실행중이 아닐때만 시작
+                    self.start_collection()
+            else:
+                if self.collection_active:  # 수집이 실행중일때만 중지
+                    self.stop_collection()
 
-    def get_last_activity_id(self):
+    def get_last_tstamp(self):
         """MSSQL에서 최대 cowactivity_id 조회"""
         try:
             with self.ms_engine.connect() as conn:
-                query = text("SELECT ISNULL(MAX(cowactivity_id), 0) as max_id FROM ICT_ACTIVITY_LOG")
+                query = text("SELECT ISNULL(MAX(tstamp), CAST('1900-01-01 00:00:00.000000' AS DATETIME2(6)))  FROM TEST_ICT_MILKING_LOG WITH(NOLOCK)")
                 result = conn.execute(query)
-                max_id = result.scalar()
-                return max_id
+                max_tstamp = result.scalar()
+                return max_tstamp
         except Exception as e:
             self.log_message(f"최대 ID 조회 오류: {str(e)}")
             raise  # 예외를 다시 발생시켜 상위에서 처리하도록 함
@@ -652,8 +717,8 @@ class DataCollectorApp(QMainWindow):
         try:
             # MSSQL에서 마지막 activity_id 조회
             try:
-                last_activity_id = self.get_last_activity_id()
-                msg = f"현재 MSSQL 마지막 ID: {last_activity_id}"
+                last_tstamp = self.get_last_tstamp()
+                msg = f"현재 MSSQL 마지막 ID: {last_tstamp}"
                 self.log_message(msg)
             except Exception as e:
                 error_msg = f"최대 ID 조회 오류: {str(e)}"
@@ -663,23 +728,49 @@ class DataCollectorApp(QMainWindow):
 
             # PostgreSQL에서 데이터 조회
             query = text("""
-                SELECT a.cowactivity_id, a.cow_id, b.cow_number, b.cow_name,
-                       a.counts, a.counts_perhr, a.cow_activity,
-                       to_char(a.tstamp, 'YYYYMMDD') AS ymd,
-                       to_char(a.tstamp, 'HH24MISS') AS hms
-                FROM tblcowactivities a
-                INNER JOIN tblcows b ON a.cow_id = b.cow_id
-                WHERE a.cowactivity_id > :max_activity_id
-                ORDER BY a.cow_id, cowactivity_id
+                            SELECT 
+                                a.milking_id,
+                                to_char(a.tstamp, 'YYYYMMDD') AS YMD,
+                                CASE 
+                                    WHEN to_char(a.tstamp, 'HH24MISS') < '120000' THEN '1' 
+                                    ELSE '2' 
+                                END AS AM_PM,
+                                to_char(a.tstamp, 'HH24MISS') AS HMS,
+                                a.cow_id,
+                                b.cow_number,
+                                b.cow_name,
+                                a.milkingshift_id,
+                                detacher_address,
+                                id_tag_number_assigned,
+                                round(CAST(float8 (milk_weight * 0.45359) as numeric), 1) AS milk_weight,
+                                round(CAST(float8 (dumped_milk * 0.45359) as numeric), 1) AS dumped_milk,
+                                milk_conductivity,
+                                cow_activity,
+                                convertunits(c.flow_0_15_sec) AS flow_0_15_sec,
+                                convertunits(c.flow_15_30_sec) AS flow_15_30_sec,
+                                convertunits(c.flow_30_60_sec) AS flow_30_60_sec,
+                                convertunits(c.flow_60_120_sec) AS flow_60_120_sec,
+                                c.time_in_low_flow,
+                                c.reattach_counter,
+                                c.percent_expected_milk,
+                                to_char(a.tstamp, 'YYYY-MM-DD HH24:MI:SS.US') AS tstamp_string
+                            FROM tblmilkings AS a
+                            LEFT OUTER JOIN public.vewcows AS b 
+                                ON a.cow_id = b.cow_id
+                            LEFT OUTER JOIN public.tblstallperformances AS c 
+                                ON a.milking_id = c.milking_id
+                            WHERE id_tag_number_assigned <> ''
+                              AND a.tstamp > :max_tstamp
+                            ORDER BY a.milkingshift_id, a.tstamp
             """)
 
             try:
                 with self.pg_engine.connect() as conn:
-                    result = conn.execute(query, {"max_activity_id": last_activity_id})
+                    result = conn.execute(query, {"max_tstamp": last_tstamp})
                     rows = result.fetchall()
 
                     if not rows:
-                        msg = "PostgreSQL 신규 데이터 없음"
+                        msg = f"PostgreSQL 신규 데이터 없음\n{'*' * 50}"
                         self.log_message(msg)
                         self.progress_bar.setValue(0)
                         return
@@ -697,28 +788,54 @@ class DataCollectorApp(QMainWindow):
                             for i, row in enumerate(rows):
                                 # SP 실행
                                 sp_query = text("""
-                                    EXEC P_ICT_ACTIVITY_LOG_M 
-                                    @cowactivity_id=:cowactivity_id,
+                                EXEC P_TEST_ICT_MILKING_LOG_M 
+                                    @milking_id=:milking_id,
+                                    @ymd=:ymd,
+                                    @am_pm=:am_pm,
+                                    @hms=:hms,
                                     @cow_id=:cow_id,
                                     @cow_number=:cow_number,
                                     @cow_name=:cow_name,
-                                    @counts=:counts,
-                                    @counts_perhr=:counts_perhr,
+                                    @milkingshift_id=:milkingshift_id,
+                                    @detacher_address=:detacher_address,
+                                    @id_tag_number_assigned=:id_tag_number_assigned,
+                                    @milk_weight=:milk_weight,
+                                    @dumped_milk=:dumped_milk,
+                                    @milk_conductivity=:milk_conductivity,
                                     @cow_activity=:cow_activity,
-                                    @ymd=:ymd,
-                                    @hms=:hms
+                                    @flow_0_15_sec=:flow_0_15_sec,
+                                    @flow_15_30_sec=:flow_15_30_sec,
+                                    @flow_30_60_sec=:flow_30_60_sec,
+                                    @flow_60_120_sec=:flow_60_120_sec,
+                                    @time_in_low_flow=:time_in_low_flow,
+                                    @reattach_counter=:reattach_counter,
+                                    @percent_expected_milk=:percent_expected_milk,
+                                    @tstamp=:tstamp_string
                                 """)
 
                                 ms_conn.execute(sp_query, {
-                                    "cowactivity_id": row.cowactivity_id,
+                                    "milking_id": row.milking_id,
+                                    "ymd": row.ymd,
+                                    "am_pm": row.am_pm,
+                                    "hms": row.hms,
                                     "cow_id": row.cow_id,
                                     "cow_number": row.cow_number,
                                     "cow_name": row.cow_name,
-                                    "counts": row.counts,
-                                    "counts_perhr": row.counts_perhr,
+                                    "milkingshift_id": row.milkingshift_id,
+                                    "detacher_address": row.detacher_address,
+                                    "id_tag_number_assigned": row.id_tag_number_assigned,
+                                    "milk_weight": row.milk_weight,
+                                    "dumped_milk": row.dumped_milk,
+                                    "milk_conductivity": row.milk_conductivity,
                                     "cow_activity": row.cow_activity,
-                                    "ymd": row.ymd,
-                                    "hms": row.hms
+                                    "flow_0_15_sec": row.flow_0_15_sec,
+                                    "flow_15_30_sec": row.flow_15_30_sec,
+                                    "flow_30_60_sec": row.flow_30_60_sec,
+                                    "flow_60_120_sec": row.flow_60_120_sec,
+                                    "time_in_low_flow": row.time_in_low_flow,
+                                    "reattach_counter": row.reattach_counter,
+                                    "percent_expected_milk": row.percent_expected_milk,
+                                    "tstamp_string": row.tstamp_string
                                 })
 
                                 # 진행률 업데이트
@@ -727,7 +844,7 @@ class DataCollectorApp(QMainWindow):
 
                             # 트랜잭션 커밋
                             trans.commit()
-                            msg = f"MSSQL 데이터 저장 완료: {total_rows}건\n{'*' * 40}"
+                            msg = f"MSSQL 데이터 저장 완료: {total_rows}건\n{'*' * 50}"
                             self.log_message(msg)
                             self.logger.info(msg)
 
@@ -788,24 +905,25 @@ class DataCollectorApp(QMainWindow):
         self.afternoon_end_hour.setEnabled(enabled)
         self.afternoon_end_min.setEnabled(enabled)
         # 수집주기 입력 필드
-        self.interval_input.setEnabled(enabled)
+        # self.interval_input.setEnabled(enabled)
 
     def start_collection(self):
-        interval = int(self.interval_input.text()) * 1000  # 초를 밀리초로 변환
+        interval = self.get_collection_interval() * 1000  # DB에서 가져온 값 사용
+        self.current_interval = interval // 1000  # 현재 값 저장
         self.collection_timer.start(interval)
         self.collection_active = True
         self.update_button_states()
-        # 데이터 수집 시작 시 입력 필드 비활성화
         self.update_input_states(False)
-        self.update_tray_tooltip()  # 상태 업데이트
-        self.log_message("데이터 수집 시작")
+        self.update_tray_tooltip()
+        self.log_message(f"데이터 수집 시작 (수집 주기: {self.current_interval}초)")
 
     def stop_collection(self):
         """데이터 수집 중지"""
         try:
             self.collection_timer.stop()
             self.collection_active = False
-            self.manual_stop = True
+            self.manual_stop = False  # 중지 후 manual_stop 플래그 리셋
+            self.auto_mode = True  # auto_mode 복원
 
             # 진행 중인 DB 트랜잭션이 있다면 롤백
             try:
@@ -840,7 +958,7 @@ class DataCollectorApp(QMainWindow):
             event.ignore()
             self.hide()
             self.tray_icon.showMessage(
-                "보우메틱 활동량",
+                "보우메틱 착유량",
                 "프로그램이 트레이로 최소화되었습니다.",
                 QSystemTrayIcon.Information,
                 2000
@@ -919,7 +1037,7 @@ class DataCollectorApp(QMainWindow):
                     event.ignore()
                     self.hide()
                     self.tray_icon.showMessage(
-                        "보우메틱 활동량",
+                        "보우메틱 착유량",
                         "프로그램이 트레이로 최소화되었습니다.\n데이터 수집은 계속 진행됩니다.",
                         QSystemTrayIcon.Information,
                         2000
@@ -930,7 +1048,7 @@ class DataCollectorApp(QMainWindow):
                 event.ignore()
                 self.hide()
                 self.tray_icon.showMessage(
-                    "보우메틱 활동량",
+                    "보우메틱 착유량",
                     "프로그램이 트레이로 최소화되었습니다.",
                     QSystemTrayIcon.Information,
                     2000
@@ -945,13 +1063,13 @@ class DataCollectorApp(QMainWindow):
     # 기존 코드에 추가: 현재 상태 표시를 위한 메서드
     def update_tray_tooltip(self):
         if self.collection_active:
-            self.tray_icon.setToolTip("보우메틱 활동량\n데이터 수집 중")
+            self.tray_icon.setToolTip("보우메틱 착유량\n데이터 수집 중")
         else:
-            self.tray_icon.setToolTip("보우메틱 활동량\n대기 중")
+            self.tray_icon.setToolTip("보우메틱 착유량\n대기 중")
 
 def main():
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon('activity.ico'))  # 애플리케이션 전체 아이콘 설정
+    app.setWindowIcon(QIcon('milking.ico'))  # 애플리케이션 전체 아이콘 설정
     window = DataCollectorApp()
     window.show()
     sys.exit(app.exec_())
@@ -959,3 +1077,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+

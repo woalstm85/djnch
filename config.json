@@ -1,11 +1,18 @@
 {
-    "am_start_hour": "06",
-    "am_start_minute": "00",
-    "am_end_hour": "10",
-    "am_end_minute": "00",
-    "pm_start_hour": "18",
-    "pm_start_minute": "00",
-    "pm_end_hour": "21",
-    "pm_end_minute": "00",
-    "interval": 30
+    "morning_start": {
+        "hour": "06",
+        "minute": "00"
+    },
+    "morning_end": {
+        "hour": "10",
+        "minute": "00"
+    },
+    "afternoon_start": {
+        "hour": "15",
+        "minute": "00"
+    },
+    "afternoon_end": {
+        "hour": "19",
+        "minute": "00"
+    }
 }
