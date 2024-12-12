@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <title>Area Map with Random Markers</title>
+    <style>
+        html, body { height: 100%; margin: 0; padding: 0; }
+        #map { height: 100vh; width: 100%; }
+    </style>
+</head>
+<body>
+    <div id="map"></div>
+    <script>
+        let map;
+        let markers = [];
+
+        // 영역 정의 - 좌표 순서 수정 (1->2->4->3)
+        const areas = [
+            {
+                name: "테스트 영역",
+                coords: [
+                    { lat: 37.503994, lng: 126.789820 },  // 1
+                    { lat: 37.504172, lng: 126.790774 },  // 2
+                    { lat: 37.503669, lng: 126.790859 },  // 4
+                    { lat: 37.503519, lng: 126.789944 }   // 3
+                ],
+                color: "#FF0000"
+            },
+            {
+                name: "테스트2",
+                coords: [
+                    { lat: 37.503657, lng: 126.788283 },  // 1
+                    { lat: 37.503854, lng: 126.789131 },  // 2
+                    { lat: 37.503427, lng: 126.789230 },  // 4
+                    { lat: 37.503282, lng: 126.788348 }   // 3
+                ],
+                color: "#0000FF"
+            },
+            {
+                name: "테스트3",
+                coords: [
+                    { lat: 37.502963, lng: 126.788466 },  // 1
+                    { lat: 37.502800, lng: 126.789179 },  // 2
+                    { lat: 37.502231, lng: 126.788720 }   // 3 (삼각형)
+                ],
+                color: "#00FF00"
+            }
+        ];
+
+        function initMap() {
+            map = new google.maps.Map(document.getElementById('map'), {
+                zoom: 18,
+                center: { lat: 37.503994, lng: 126.789820 },
+                mapTypeId: 'hybrid',
+                rotateControl: false,
+                streetViewControl: false
+            });
+
+            // 영역 그리기 - 폴리곤 닫기 추가
+            areas.forEach(area => {
+                const pathCoords = [...area.coords];
+                pathCoords.push(pathCoords[0]); // 첫 점을 마지막에 추가하여 폴리곤 닫기
+
+                new google.maps.Polygon({
+                    paths: pathCoords,
+                    strokeColor: area.color,
+                    strokeWeight: 2,
+                    fillColor: area.color,
+                    fillOpacity: 0.35,
+                    map: map
+                });
+            });
+
+            // 초기 마커 생성
+            createMarkers();
+
+            // 10초마다 마커 위치 업데이트
+            setInterval(updateMarkers, 5000);
+        }
+
+        function getRandomPoint(vertices) {
+            let bounds = new google.maps.LatLngBounds();
+            vertices.forEach(vertex => bounds.extend(vertex));
+
+            const tries = 100;
+            for(let i = 0; i < tries; i++) {
+                const lat = bounds.getSouthWest().lat() +
+                          (bounds.getNorthEast().lat() - bounds.getSouthWest().lat()) * Math.random();
+                const lng = bounds.getSouthWest().lng() +
+                          (bounds.getNorthEast().lng() - bounds.getSouthWest().lng()) * Math.random();
+
+                const point = new google.maps.LatLng(lat, lng);
+                const polygon = new google.maps.Polygon({ paths: vertices });
+
+                if (google.maps.geometry.poly.containsLocation(point, polygon)) {
+                    return { lat, lng };
+                }
+            }
+
+            return {
+                lat: (bounds.getNorthEast().lat() + bounds.getSouthWest().lat()) / 2,
+                lng: (bounds.getNorthEast().lng() + bounds.getSouthWest().lng()) / 2
+            };
+        }
+
+        function createMarkers() {
+            markers.forEach(marker => marker.setMap(null));
+            markers = [];
+
+            areas.forEach((area, index) => {
+                const position = getRandomPoint(area.coords);
+                const marker = new google.maps.Marker({
+                    position: position,
+                    map: map,
+                    title: `Moving Point ${index + 1}`,
+                    icon: {
+                        path: google.maps.SymbolPath.CIRCLE,
+                        fillColor: "#FFFFFF",
+                        fillOpacity: 1,
+                        strokeColor: area.color,
+                        strokeWeight: 2,
+                        scale: 8
+                    }
+                });
+                markers.push(marker);
+            });
+        }
+
+        function updateMarkers() {
+            areas.forEach((area, index) => {
+                const newPosition = getRandomPoint(area.coords);
+                markers[index].setPosition(newPosition);
+            });
+        }
+    </script>
+    <script src="https://maps.googleapis.com/maps/api/js?key=AIzaSyDNiiHzhqOX79XJjQ6gHyFd9dGIfyekJJw&libraries=geometry&callback=initMap" async defer></script>
+</body>
+</html>
